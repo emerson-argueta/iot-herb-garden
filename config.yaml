@@ -1,0 +1,15 @@
+broker:
+  address: "tcp://localhost:1883"
+  client_id: "garden_brain"
+
+plants:
+  thyme_1:
+    min_moisture: 20
+    max_moisture: 40
+    min_temp: 18.0
+    max_temp: 25.0
+  lavender_1:
+    min_moisture: 15
+    max_moisture: 35
+    min_temp: 15.0
+    max_temp: 28.0
