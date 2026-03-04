@@ -1,0 +1,7 @@
+## IDF Component Manager manifest for the herb-edge main component.
+## Run `idf.py add-dependency` or let `idf.py build` auto-fetch on first build.
+dependencies:
+  espressif/onewire_bus: ">=0.1.1"
+  espressif/ds18b20: ">=0.1.2"
+  idf:
+    version: ">=5.1.0"

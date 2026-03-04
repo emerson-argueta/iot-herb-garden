@@ -1,20 +1,18 @@
-version: '3.8'
-
 services:
   mosquitto:
-    image: eclipse-mosquitto:2.0
-    container_name: garden_mosquitto
+    image: eclipse-mosquitto:2
+    container_name: herb-mosquitto
     restart: unless-stopped
     ports:
       - "1883:1883"
-      - "9001:9001"
     volumes:
-      - ./mosquitto/config:/mosquitto/config
-      - ./mosquitto/data:/mosquitto/data
-      - ./mosquitto/log:/mosquitto/log
-    networks:
-      - garden_network
+      - ./mosquitto/config:/mosquitto/config:ro
+      - mosquitto-data:/mosquitto/data
+    healthcheck:
+      test: ["CMD", "mosquitto_sub", "-t", "$$SYS/#", "-C", "1", "-W", "3"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
 
-networks:
-  garden_network:
-    driver: bridge
+volumes:
+  mosquitto-data:

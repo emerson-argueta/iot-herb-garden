@@ -1,344 +1,467 @@
 /*
- * ESP32 Edge Node Firmware
- * Hub-and-Spoke IoT Herb Garden Monitor
+ * herb-edge — ESP32 edge node firmware
+ *
+ * Hardware
+ *   Moisture  : capacitive soil sensor → ADC1 (GPIO34 = ch6 by default)
+ *   Temp      : DS18B20 one-wire       → GPIO4  (4.7 kΩ pull-up to 3.3 V)
+ *   Pump      : relay module           → GPIO26 (active HIGH)
+ *
+ * MQTT flow (hub-and-spoke; brain is sole state manager)
+ *   Publish  garden/setup          {"mac":"…","status":"awaiting_provision"}
+ *   Subscribe garden/setup/{MAC}   {"assign_id":"plant_id"}   → provision
+ *   Publish  garden/telemetry      {"plant_id":"…","moisture":…,"temp":…}
+ *   Subscribe garden/command/{id}  {"action":"water_on"|"water_off"}
+ *
+ * Provisioning
+ *   plant_id is persisted in NVS.  On first boot (empty NVS) the node enters
+ *   provisioning mode, beaconing to garden/setup every 10 s until the brain
+ *   (or TUI) replies with an assign_id.  The node resets on next boot if NVS
+ *   is erased (idf.py erase-flash), returning to provisioning mode.
  */
 
-#include <stdio.h>
-#include <string.h>
+#include <cstring>
+#include <cstdio>
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
+
 #include "esp_system.h"
 #include "esp_wifi.h"
+#include "esp_netif.h"
 #include "esp_event.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "nvs_flash.h"
+#include "nvs.h"
 #include "mqtt_client.h"
+#include "esp_adc/adc_oneshot.h"
+#include "driver/gpio.h"
 #include "cJSON.h"
-#include "driver/adc.h"
-#include "driver/temperature_sensor.h"
 
-// Configuration
-#define WIFI_SSID      "YOUR_WIFI_SSID"
-#define WIFI_PASSWORD  "YOUR_WIFI_PASSWORD"
-#define MQTT_BROKER    "mqtt://192.168.1.100:1883"
+#include "onewire_bus.h"
+#include "ds18b20.h"
 
-#define NVS_NAMESPACE  "plant_config"
-#define NVS_PLANT_ID   "plant_id"
+static const char *TAG = "herb-edge";
 
-#define TELEMETRY_INTERVAL_MS  (15 * 60 * 1000)  // 15 minutes
-#define MOISTURE_ADC_CHANNEL   ADC1_CHANNEL_0     // GPIO36
+// ── Pin / channel configuration (from Kconfig) ────────────────────────────────
 
-static const char *TAG = "EDGE_NODE";
+#define PUMP_GPIO         ((gpio_num_t)CONFIG_PUMP_GPIO)
+#define MOISTURE_ADC_CH   ((adc_channel_t)CONFIG_MOISTURE_ADC_CHANNEL)
+#define ONEWIRE_BUS_GPIO  CONFIG_ONEWIRE_GPIO
 
-// Global state
-static char plant_id[64] = {0};
-static bool provisioned = false;
-static esp_mqtt_client_handle_t mqtt_client = NULL;
-static EventGroupHandle_t wifi_event_group;
-static const int WIFI_CONNECTED_BIT = BIT0;
+// ── Timing ────────────────────────────────────────────────────────────────────
 
-// Function declarations
-static void wifi_init_sta(void);
-static void mqtt_init(void);
-static void check_provisioning(void);
-static void telemetry_task(void *pvParameters);
-static float read_moisture(void);
-static float read_temperature(void);
+#define TELEMETRY_MS          (30 * 1000)   // publish sensor data every 30 s
+#define SETUP_BEACON_MS       (10 * 1000)   // re-announce until provisioned
+#define PUMP_MAX_ON_US        ((uint64_t)CONFIG_PUMP_MAX_ON_SECONDS * 1000000ULL)
 
-// NVS Operations
-static bool load_plant_id_from_nvs(void) {
-    nvs_handle_t nvs_handle;
-    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &nvs_handle);
-    if (err != ESP_OK) {
-        ESP_LOGI(TAG, "NVS namespace not found, device is unprovisioned");
-        return false;
-    }
+// ── NVS keys ──────────────────────────────────────────────────────────────────
 
-    size_t required_size = sizeof(plant_id);
-    err = nvs_get_str(nvs_handle, NVS_PLANT_ID, plant_id, &required_size);
-    nvs_close(nvs_handle);
+#define NVS_NAMESPACE   "herb"
+#define NVS_KEY_PLANT   "plant_id"
 
-    if (err == ESP_OK) {
-        ESP_LOGI(TAG, "Loaded plant_id from NVS: %s", plant_id);
-        return true;
-    }
+// ── Event bits ────────────────────────────────────────────────────────────────
 
-    ESP_LOGI(TAG, "No plant_id in NVS");
-    return false;
+#define EV_WIFI_UP    BIT0
+#define EV_MQTT_UP    BIT1
+#define EV_PROVISION  BIT2   // plant_id is known and stored
+
+static EventGroupHandle_t s_ev;
+
+// ── Shared state (written once then read-only) ────────────────────────────────
+
+static char s_plant_id[64] = {};    // empty = not yet provisioned
+static char s_mac_str[13]  = {};    // "AABBCCDDEEFF" (no colons)
+static esp_mqtt_client_handle_t s_mqtt = nullptr;
+
+// ── Actuator + safety timer ───────────────────────────────────────────────────
+
+static esp_timer_handle_t s_pump_timer = nullptr;
+
+// Called by esp_timer when the safety cut-off fires.
+static void pump_cutoff_cb(void *)
+{
+    gpio_set_level(PUMP_GPIO, 0);
+    ESP_LOGW(TAG, "pump safety cut-off fired after %d s — relay forced OFF",
+             CONFIG_PUMP_MAX_ON_SECONDS);
 }
 
-static esp_err_t save_plant_id_to_nvs(const char *id) {
-    nvs_handle_t nvs_handle;
-    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs_handle);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to open NVS: %s", esp_err_to_name(err));
-        return err;
-    }
-
-    err = nvs_set_str(nvs_handle, NVS_PLANT_ID, id);
-    if (err == ESP_OK) {
-        err = nvs_commit(nvs_handle);
-        ESP_LOGI(TAG, "Saved plant_id to NVS: %s", id);
-    }
-
-    nvs_close(nvs_handle);
-    return err;
+static void pump_timer_init(void)
+{
+    const esp_timer_create_args_t args = {
+        .callback        = pump_cutoff_cb,
+        .arg             = nullptr,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name            = "pump_cutoff",
+        .skip_unhandled_events = true,
+    };
+    ESP_ERROR_CHECK(esp_timer_create(&args, &s_pump_timer));
 }
 
-// WiFi Event Handler
-static void wifi_event_handler(void* arg, esp_event_base_t event_base,
-                               int32_t event_id, void* event_data) {
-    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+static void pump_set(bool on)
+{
+    gpio_set_level(PUMP_GPIO, on ? 1 : 0);
+    ESP_LOGI(TAG, "pump → %s", on ? "ON" : "OFF");
+
+    if (on) {
+        // (Re-)arm the one-shot safety timer every time the pump turns on.
+        esp_timer_stop(s_pump_timer);   // no-op if not running
+        esp_timer_start_once(s_pump_timer, PUMP_MAX_ON_US);
+        ESP_LOGI(TAG, "pump safety timer armed (%d s)", CONFIG_PUMP_MAX_ON_SECONDS);
+    } else {
+        // Disarm if the brain sent an explicit water_off before the cut-off.
+        esp_timer_stop(s_pump_timer);
+    }
+}
+
+// ── NVS helpers ───────────────────────────────────────────────────────────────
+
+static void nvs_load_plant_id(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) return;
+    size_t len = sizeof(s_plant_id);
+    if (nvs_get_str(h, NVS_KEY_PLANT, s_plant_id, &len) == ESP_OK && s_plant_id[0]) {
+        ESP_LOGI(TAG, "plant_id from NVS: %s", s_plant_id);
+        xEventGroupSetBits(s_ev, EV_PROVISION);
+    }
+    nvs_close(h);
+}
+
+static void nvs_save_plant_id(const char *id)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) return;
+    nvs_set_str(h, NVS_KEY_PLANT, id);
+    nvs_commit(h);
+    nvs_close(h);
+    ESP_LOGI(TAG, "plant_id saved to NVS: %s", id);
+}
+
+// ── Sensor initialisation ─────────────────────────────────────────────────────
+
+static adc_oneshot_unit_handle_t s_adc  = nullptr;
+static ds18b20_device_handle_t   s_ds   = nullptr;
+
+static void sensors_init(void)
+{
+    // ── ADC for capacitive soil moisture ──────────────────────────────────────
+    const adc_oneshot_unit_init_cfg_t adc_init = { .unit_id = ADC_UNIT_1 };
+    ESP_ERROR_CHECK(adc_oneshot_new_unit(&adc_init, &s_adc));
+
+    const adc_oneshot_chan_cfg_t chan_cfg = {
+        .atten    = ADC_ATTEN_DB_12,
+        .bitwidth = ADC_BITWIDTH_DEFAULT,
+    };
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(s_adc, MOISTURE_ADC_CH, &chan_cfg));
+
+    // ── DS18B20 on one-wire bus ───────────────────────────────────────────────
+    const onewire_bus_config_t     bus_cfg = { .bus_gpio_num = ONEWIRE_BUS_GPIO };
+    const onewire_bus_rmt_config_t rmt_cfg = { .max_rx_bytes = 10 };
+    onewire_bus_handle_t ow_bus;
+    ESP_ERROR_CHECK(onewire_new_bus_rmt(&bus_cfg, &rmt_cfg, &ow_bus));
+
+    onewire_device_iter_handle_t it;
+    ESP_ERROR_CHECK(onewire_new_device_iter(ow_bus, &it));
+    onewire_device_t dev;
+    while (onewire_device_iter_get_next(it, &dev) == ESP_OK) {
+        const ds18b20_config_t ds_cfg = {};
+        if (ds18b20_new_device(&dev, &ds_cfg, &s_ds) == ESP_OK) {
+            ESP_LOGI(TAG, "DS18B20 found on GPIO%d", ONEWIRE_BUS_GPIO);
+            break;
+        }
+    }
+    onewire_del_device_iter(it);
+    if (!s_ds) ESP_LOGW(TAG, "no DS18B20 found — temperature will read 0.0");
+
+    // ── Pump relay GPIO ───────────────────────────────────────────────────────
+    const gpio_config_t pump_io = {
+        .pin_bit_mask  = 1ULL << CONFIG_PUMP_GPIO,
+        .mode          = GPIO_MODE_OUTPUT,
+        .pull_up_en    = GPIO_PULLUP_DISABLE,
+        .pull_down_en  = GPIO_PULLDOWN_DISABLE,
+        .intr_type     = GPIO_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&pump_io));
+    pump_timer_init();
+    pump_set(false);
+}
+
+// ── Sensor reading ────────────────────────────────────────────────────────────
+
+/*
+ * Moisture percentage from a capacitive sensor.
+ * Calibrate DRY / WET to your specific sensor and supply voltage.
+ * Typical 3.3 V 12-bit readings: ~3100 (air) → ~1300 (submerged).
+ */
+static float read_moisture(void)
+{
+    constexpr int DRY = 3100, WET = 1300;
+    int raw = 0;
+    adc_oneshot_read(s_adc, MOISTURE_ADC_CH, &raw);
+    float pct = 100.0f * (float)(DRY - raw) / (float)(DRY - WET);
+    if (pct < 0.0f)   pct = 0.0f;
+    if (pct > 100.0f) pct = 100.0f;
+    return pct;
+}
+
+/*
+ * DS18B20 temperature read.  Triggers a 12-bit conversion (≤750 ms) then
+ * reads the result.  Returns 0.0 if no sensor was detected at boot.
+ */
+static float read_temperature(void)
+{
+    if (!s_ds) return 0.0f;
+    float t = 0.0f;
+    ds18b20_trigger_temperature_conversion(s_ds);
+    vTaskDelay(pdMS_TO_TICKS(750));   // 12-bit conversion time
+    ds18b20_get_temperature(s_ds, &t);
+    return t;
+}
+
+// ── WiFi ──────────────────────────────────────────────────────────────────────
+
+static void wifi_event_handler(void *, esp_event_base_t base,
+                               int32_t id, void *)
+{
+    if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+        ESP_LOGW(TAG, "WiFi disconnected — reconnecting");
+        xEventGroupClearBits(s_ev, EV_WIFI_UP);
         esp_wifi_connect();
-    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        ESP_LOGI(TAG, "WiFi disconnected, reconnecting...");
-        esp_wifi_connect();
-        xEventGroupClearBits(wifi_event_group, WIFI_CONNECTED_BIT);
-    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
-        ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
-        ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
-        xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_BIT);
+    } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
+        xEventGroupSetBits(s_ev, EV_WIFI_UP);
+        ESP_LOGI(TAG, "WiFi connected");
     }
 }
 
-// WiFi Initialization
-static void wifi_init_sta(void) {
-    wifi_event_group = xEventGroupCreate();
-
+static void wifi_start(void)
+{
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     esp_netif_create_default_wifi_sta();
 
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    wifi_init_config_t init = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&init));
 
-    esp_event_handler_instance_t instance_any_id;
-    esp_event_handler_instance_t instance_got_ip;
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
-                                                        ESP_EVENT_ANY_ID,
-                                                        &wifi_event_handler,
-                                                        NULL,
-                                                        &instance_any_id));
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT,
-                                                        IP_EVENT_STA_GOT_IP,
-                                                        &wifi_event_handler,
-                                                        NULL,
-                                                        &instance_got_ip));
+    ESP_ERROR_CHECK(esp_event_handler_register(
+        WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler, nullptr));
+    ESP_ERROR_CHECK(esp_event_handler_register(
+        IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event_handler, nullptr));
 
-    wifi_config_t wifi_config = {};
-    strcpy((char*)wifi_config.sta.ssid, WIFI_SSID);
-    strcpy((char*)wifi_config.sta.password, WIFI_PASSWORD);
-    wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+    wifi_config_t cfg = {};
+    strncpy((char *)cfg.sta.ssid,     CONFIG_WIFI_SSID,     sizeof(cfg.sta.ssid) - 1);
+    strncpy((char *)cfg.sta.password, CONFIG_WIFI_PASSWORD, sizeof(cfg.sta.password) - 1);
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &cfg));
     ESP_ERROR_CHECK(esp_wifi_start());
-
-    ESP_LOGI(TAG, "WiFi initialization complete");
+    ESP_ERROR_CHECK(esp_wifi_connect());
 }
 
-// MQTT Event Handler
-static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
-                               int32_t event_id, void *event_data) {
-    esp_mqtt_event_handle_t event = (esp_mqtt_event_handle_t)event_data;
-
-    switch ((esp_mqtt_event_id_t)event_id) {
-        case MQTT_EVENT_CONNECTED:
-            ESP_LOGI(TAG, "MQTT connected");
-
-            if (!provisioned) {
-                // Subscribe to setup topic with our MAC
-                uint8_t mac[6];
-                esp_efuse_mac_get_default(mac);
-                char setup_topic[64];
-                snprintf(setup_topic, sizeof(setup_topic),
-                        "garden/setup/%02X%02X%02X", mac[3], mac[4], mac[5]);
-                esp_mqtt_client_subscribe(mqtt_client, setup_topic, 0);
-                ESP_LOGI(TAG, "Subscribed to %s", setup_topic);
-
-                // Broadcast unprovisioned status
-                cJSON *json = cJSON_CreateObject();
-                char mac_str[18];
-                snprintf(mac_str, sizeof(mac_str), "%02X%02X%02X",
-                        mac[3], mac[4], mac[5]);
-                cJSON_AddStringToObject(json, "mac", mac_str);
-                cJSON_AddStringToObject(json, "status", "awaiting_provision");
-                char *payload = cJSON_PrintUnformatted(json);
-                esp_mqtt_client_publish(mqtt_client, "garden/setup", payload, 0, 0, 0);
-                ESP_LOGI(TAG, "Broadcast: awaiting provision (MAC: %s)", mac_str);
-                free(payload);
-                cJSON_Delete(json);
-            }
-            break;
-
-        case MQTT_EVENT_DATA:
-            ESP_LOGI(TAG, "MQTT data received on topic: %.*s", event->topic_len, event->topic);
-
-            if (!provisioned && strstr(event->topic, "garden/setup/") != NULL) {
-                // Parse assignment message
-                cJSON *json = cJSON_ParseWithLength(event->data, event->data_len);
-                if (json != NULL) {
-                    cJSON *assign_id = cJSON_GetObjectItem(json, "assign_id");
-                    if (assign_id != NULL && cJSON_IsString(assign_id)) {
-                        const char *id = assign_id->valuestring;
-                        ESP_LOGI(TAG, "Received plant assignment: %s", id);
-
-                        if (save_plant_id_to_nvs(id) == ESP_OK) {
-                            ESP_LOGI(TAG, "Provisioning complete, restarting...");
-                            vTaskDelay(pdMS_TO_TICKS(1000));
-                            esp_restart();
-                        }
-                    }
-                    cJSON_Delete(json);
-                }
-            }
-            break;
-
-        case MQTT_EVENT_ERROR:
-            ESP_LOGE(TAG, "MQTT error");
-            break;
-
-        case MQTT_EVENT_DISCONNECTED:
-            ESP_LOGI(TAG, "MQTT disconnected");
-            break;
-
-        default:
-            break;
-    }
-}
-
-// MQTT Initialization
-static void mqtt_init(void) {
-    esp_mqtt_client_config_t mqtt_cfg = {};
-    mqtt_cfg.broker.address.uri = MQTT_BROKER;
-
+static void build_mac_string(void)
+{
     uint8_t mac[6];
-    esp_efuse_mac_get_default(mac);
-    char client_id[32];
-    snprintf(client_id, sizeof(client_id), "edge_%02X%02X%02X",
-            mac[3], mac[4], mac[5]);
-    mqtt_cfg.credentials.client_id = client_id;
-
-    mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
-    esp_mqtt_client_register_event(mqtt_client, (esp_mqtt_event_id_t)ESP_EVENT_ANY_ID,
-                                   mqtt_event_handler, NULL);
-    esp_mqtt_client_start(mqtt_client);
-
-    ESP_LOGI(TAG, "MQTT client started (ID: %s)", client_id);
+    esp_wifi_get_mac(WIFI_IF_STA, mac);
+    snprintf(s_mac_str, sizeof(s_mac_str), "%02X%02X%02X%02X%02X%02X",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    ESP_LOGI(TAG, "MAC: %s", s_mac_str);
 }
 
-// Sensor Reading Functions
-static float read_moisture(void) {
-    // Configure ADC for moisture sensor
-    adc1_config_width(ADC_WIDTH_BIT_12);
-    adc1_config_channel_atten(MOISTURE_ADC_CHANNEL, ADC_ATTEN_DB_11);
+// ── MQTT message dispatch ─────────────────────────────────────────────────────
 
-    // Read raw value
-    int raw = adc1_get_raw(MOISTURE_ADC_CHANNEL);
+static void handle_setup_response(const char *data, int data_len)
+{
+    cJSON *root = cJSON_ParseWithLength(data, data_len);
+    if (!root) return;
 
-    // Convert to percentage (calibration needed for real sensors)
-    // Assuming 0-4095 maps to 0-100% (inverted: wet=high voltage, dry=low)
-    float moisture = ((4095 - raw) / 4095.0f) * 100.0f;
+    const cJSON *id = cJSON_GetObjectItemCaseSensitive(root, "assign_id");
+    if (cJSON_IsString(id) && id->valuestring[0]) {
+        strncpy(s_plant_id, id->valuestring, sizeof(s_plant_id) - 1);
+        nvs_save_plant_id(s_plant_id);
 
-    ESP_LOGI(TAG, "Moisture raw: %d, percentage: %.1f%%", raw, moisture);
-    return moisture;
+        // Subscribe to the command topic now that we have an identity.
+        char cmd_topic[80];
+        snprintf(cmd_topic, sizeof(cmd_topic), "garden/command/%s", s_plant_id);
+        esp_mqtt_client_subscribe(s_mqtt, cmd_topic, 1);
+        ESP_LOGI(TAG, "subscribed to %s", cmd_topic);
+
+        xEventGroupSetBits(s_ev, EV_PROVISION);
+        ESP_LOGI(TAG, "provisioned as %s", s_plant_id);
+    }
+    cJSON_Delete(root);
 }
 
-static float read_temperature(void) {
-    // Use ESP32's internal temperature sensor
-    temperature_sensor_handle_t temp_sensor = NULL;
-    temperature_sensor_config_t temp_config = TEMPERATURE_SENSOR_CONFIG_DEFAULT(-10, 80);
+static void handle_command(const char *data, int data_len)
+{
+    cJSON *root = cJSON_ParseWithLength(data, data_len);
+    if (!root) return;
 
-    esp_err_t err = temperature_sensor_install(&temp_config, &temp_sensor);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Temperature sensor install failed");
-        return 0.0f;
+    const cJSON *act = cJSON_GetObjectItemCaseSensitive(root, "action");
+    if (cJSON_IsString(act)) {
+        if      (strcmp(act->valuestring, "water_on")  == 0) pump_set(true);
+        else if (strcmp(act->valuestring, "water_off") == 0) pump_set(false);
+        else ESP_LOGW(TAG, "unknown action: %s", act->valuestring);
+    }
+    cJSON_Delete(root);
+}
+
+static void on_mqtt_data(const char *topic, int topic_len,
+                         const char *data,  int data_len)
+{
+    // garden/setup/{MAC}
+    char setup_topic[80];
+    int setup_len = snprintf(setup_topic, sizeof(setup_topic),
+                             "garden/setup/%s", s_mac_str);
+    if (topic_len == setup_len && strncmp(topic, setup_topic, topic_len) == 0) {
+        handle_setup_response(data, data_len);
+        return;
     }
 
-    temperature_sensor_enable(temp_sensor);
-
-    float temp_celsius;
-    temperature_sensor_get_celsius(temp_sensor, &temp_celsius);
-
-    temperature_sensor_disable(temp_sensor);
-    temperature_sensor_uninstall(temp_sensor);
-
-    ESP_LOGI(TAG, "Temperature: %.1f°C", temp_celsius);
-    return temp_celsius;
+    // garden/command/{plant_id}
+    if (s_plant_id[0]) {
+        char cmd_topic[80];
+        int cmd_len = snprintf(cmd_topic, sizeof(cmd_topic),
+                               "garden/command/%s", s_plant_id);
+        if (topic_len == cmd_len && strncmp(topic, cmd_topic, topic_len) == 0) {
+            handle_command(data, data_len);
+        }
+    }
 }
 
-// Telemetry Task (FreeRTOS)
-static void telemetry_task(void *pvParameters) {
-    ESP_LOGI(TAG, "Telemetry task started for plant: %s", plant_id);
+// ── MQTT event handler ────────────────────────────────────────────────────────
 
-    while (1) {
-        // Wait for WiFi and MQTT connection
-        xEventGroupWaitBits(wifi_event_group, WIFI_CONNECTED_BIT, false, true, portMAX_DELAY);
-        vTaskDelay(pdMS_TO_TICKS(5000)); // Give MQTT time to connect
+static void mqtt_event_handler(void *, esp_event_base_t,
+                               int32_t id, void *event_data)
+{
+    auto *ev = static_cast<esp_mqtt_event_handle_t>(event_data);
+    switch (id) {
+    case MQTT_EVENT_CONNECTED:
+        ESP_LOGI(TAG, "MQTT connected");
+        xEventGroupSetBits(s_ev, EV_MQTT_UP);
 
-        // Read sensors
-        float moisture = read_moisture();
-        float temp = read_temperature();
+        // Always (re-)subscribe to our setup topic so reprovisioning works.
+        {
+            char setup_topic[80];
+            snprintf(setup_topic, sizeof(setup_topic), "garden/setup/%s", s_mac_str);
+            esp_mqtt_client_subscribe(s_mqtt, setup_topic, 1);
+        }
+        // If already provisioned, re-subscribe to the command topic.
+        if (s_plant_id[0]) {
+            char cmd_topic[80];
+            snprintf(cmd_topic, sizeof(cmd_topic), "garden/command/%s", s_plant_id);
+            esp_mqtt_client_subscribe(s_mqtt, cmd_topic, 1);
+        }
+        break;
 
-        // Build JSON payload
-        cJSON *json = cJSON_CreateObject();
-        cJSON_AddStringToObject(json, "plant_id", plant_id);
-        cJSON_AddNumberToObject(json, "moisture", moisture);
-        cJSON_AddNumberToObject(json, "temp", temp);
+    case MQTT_EVENT_DISCONNECTED:
+        ESP_LOGW(TAG, "MQTT disconnected");
+        xEventGroupClearBits(s_ev, EV_MQTT_UP);
+        break;
 
-        char *payload = cJSON_PrintUnformatted(json);
+    case MQTT_EVENT_DATA:
+        on_mqtt_data(ev->topic, ev->topic_len, ev->data, ev->data_len);
+        break;
 
-        // Publish telemetry
-        int msg_id = esp_mqtt_client_publish(mqtt_client, "garden/telemetry", payload, 0, 0, 0);
-        if (msg_id >= 0) {
-            ESP_LOGI(TAG, "Published telemetry: moisture=%.1f%%, temp=%.1f°C", moisture, temp);
-        } else {
-            ESP_LOGE(TAG, "Failed to publish telemetry");
+    default:
+        break;
+    }
+}
+
+static void mqtt_start(void)
+{
+    const esp_mqtt_client_config_t cfg = {
+        .broker = { .address = { .uri = CONFIG_MQTT_BROKER_URI } },
+    };
+    s_mqtt = esp_mqtt_client_init(&cfg);
+    ESP_ERROR_CHECK(esp_mqtt_client_register_event(
+        s_mqtt, (esp_mqtt_event_id_t)ESP_EVENT_ANY_ID,
+        mqtt_event_handler, nullptr));
+    ESP_ERROR_CHECK(esp_mqtt_client_start(s_mqtt));
+}
+
+// ── Telemetry task ────────────────────────────────────────────────────────────
+
+static void telemetry_task(void *)
+{
+    TickType_t last_wake = xTaskGetTickCount();
+    for (;;) {
+        // Block until the node is both provisioned and MQTT is up.
+        xEventGroupWaitBits(s_ev, EV_PROVISION | EV_MQTT_UP,
+                            pdFALSE, pdTRUE, portMAX_DELAY);
+
+        const float moisture = read_moisture();
+        const float temp     = read_temperature();
+
+        char buf[128];
+        snprintf(buf, sizeof(buf),
+                 "{\"plant_id\":\"%s\",\"moisture\":%.1f,\"temp\":%.1f}",
+                 s_plant_id, moisture, temp);
+        esp_mqtt_client_publish(s_mqtt, "garden/telemetry", buf, 0, 1, 0);
+        ESP_LOGI(TAG, "telemetry: %s", buf);
+
+        vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(TELEMETRY_MS));
+    }
+}
+
+// ── Setup beacon task (active only before provisioning) ───────────────────────
+
+static void setup_beacon_task(void *)
+{
+    for (;;) {
+        // Self-terminate once provisioned.
+        if (xEventGroupGetBits(s_ev) & EV_PROVISION) {
+            ESP_LOGI(TAG, "provisioned — beacon task done");
+            vTaskDelete(nullptr);
+            return;
         }
 
-        free(payload);
-        cJSON_Delete(json);
+        // Wait for MQTT before sending.
+        xEventGroupWaitBits(s_ev, EV_MQTT_UP, pdFALSE, pdTRUE, portMAX_DELAY);
 
-        // Sleep for 15 minutes
-        vTaskDelay(pdMS_TO_TICKS(TELEMETRY_INTERVAL_MS));
+        char buf[96];
+        snprintf(buf, sizeof(buf),
+                 "{\"mac\":\"%s\",\"status\":\"awaiting_provision\"}", s_mac_str);
+        esp_mqtt_client_publish(s_mqtt, "garden/setup", buf, 0, 1, 0);
+        ESP_LOGI(TAG, "setup beacon sent");
+
+        vTaskDelay(pdMS_TO_TICKS(SETUP_BEACON_MS));
     }
 }
 
-// Main Application
-extern "C" void app_main(void) {
-    ESP_LOGI(TAG, "ESP32 Edge Node starting...");
+// ── Entry point ───────────────────────────────────────────────────────────────
 
-    // Initialize NVS
+extern "C" void app_main(void)
+{
+    ESP_LOGI(TAG, "herb-edge starting");
+
+    // Initialise NVS (erase if partition is full or schema changed).
     esp_err_t ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES ||
+        ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_LOGW(TAG, "NVS partition wiped");
         ESP_ERROR_CHECK(nvs_flash_erase());
-        ret = nvs_flash_init();
-    }
-    ESP_ERROR_CHECK(ret);
-
-    // Check provisioning status
-    provisioned = load_plant_id_from_nvs();
-
-    if (provisioned) {
-        ESP_LOGI(TAG, "Device is provisioned as: %s", plant_id);
-    } else {
-        ESP_LOGI(TAG, "Device is NOT provisioned, entering setup mode");
+        ESP_ERROR_CHECK(nvs_flash_init());
     }
 
-    // Initialize WiFi
-    wifi_init_sta();
+    s_ev = xEventGroupCreate();
 
-    // Wait for WiFi connection
-    xEventGroupWaitBits(wifi_event_group, WIFI_CONNECTED_BIT, false, true, portMAX_DELAY);
+    nvs_load_plant_id();   // sets EV_PROVISION if plant_id exists
+    sensors_init();
+    wifi_start();
 
-    // Initialize MQTT
-    mqtt_init();
+    // Need WiFi up before querying MAC and starting MQTT.
+    xEventGroupWaitBits(s_ev, EV_WIFI_UP, pdFALSE, pdTRUE, portMAX_DELAY);
+    build_mac_string();
+    mqtt_start();
 
-    // If provisioned, start telemetry task
-    if (provisioned) {
-        xTaskCreate(telemetry_task, "telemetry", 4096, NULL, 5, NULL);
-    } else {
-        ESP_LOGI(TAG, "Waiting for provisioning...");
+    // Telemetry runs always (blocks internally until provisioned + MQTT up).
+    xTaskCreate(telemetry_task, "telemetry", 4096, nullptr, 5, nullptr);
+
+    // Beacon only needed if not yet provisioned.
+    if (!(xEventGroupGetBits(s_ev) & EV_PROVISION)) {
+        xTaskCreate(setup_beacon_task, "beacon", 2048, nullptr, 4, nullptr);
     }
+
+    ESP_LOGI(TAG, "startup complete");
 }

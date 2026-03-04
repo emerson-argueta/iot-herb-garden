@@ -1,6 +1,6 @@
-module github.com/emerson/iot-herb-garden/brain
+module github.com/iot-herb-garden/brain
 
-go 1.21
+go 1.22
 
 require (
 	github.com/eclipse/paho.mqtt.golang v1.4.3
@@ -9,6 +9,6 @@ require (
 
 require (
 	github.com/gorilla/websocket v1.5.0 // indirect
-	golang.org/x/net v0.8.0 // indirect
-	golang.org/x/sync v0.1.0 // indirect
+	golang.org/x/net v0.17.0 // indirect
+	golang.org/x/sync v0.4.0 // indirect
 )

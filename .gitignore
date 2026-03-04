@@ -1,0 +1,27 @@
+# ── Go ────────────────────────────────────────────────────────────────────────
+# Compiled binaries
+brain/herb-brain
+tui/herb-tui
+tui/tui
+
+# ── ESP-IDF ───────────────────────────────────────────────────────────────────
+esp32_edge/build/
+esp32_edge/sdkconfig          # generated from sdkconfig.defaults + menuconfig
+esp32_edge/sdkconfig.old
+esp32_edge/managed_components/ # fetched by idf_component_manager on first build
+esp32_edge/dependencies.lock
+
+# User-local overrides (WiFi creds, broker IP) — never commit
+esp32_edge/sdkconfig.local
+
+# ── PlatformIO ────────────────────────────────────────────────────────────────
+m5paper_display/.pio/
+m5paper_display/.vscode/
+
+# ── Mosquitto ─────────────────────────────────────────────────────────────────
+mosquitto/data/
+
+# ── IDE / OS ──────────────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.DS_Store

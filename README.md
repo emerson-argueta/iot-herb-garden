@@ -1,183 +1,231 @@
-# Hub-and-Spoke IoT Herb Garden Monitor
+# IoT Herb Garden Monitor
 
-Local, air-gapped MQTT-based IoT system for monitoring herb garden sensors with central state management.
-
-## Architecture
+Local-only, MQTT-based herb garden monitor. No cloud, no REST API.
 
 ```
-┌─────────────┐
-│ ESP32 Edge  │──┐
-│   Nodes     │  │
-└─────────────┘  │
-                 │    ┌──────────────┐      ┌─────────────┐
-┌─────────────┐  ├────│  Mosquitto   │──────│  Go Brain   │
-│ ESP32 Edge  │──┤    │  MQTT Broker │      │   Daemon    │
-│   Nodes     │  │    └──────────────┘      └─────────────┘
-└─────────────┘  │           │                      │
-                 │           │                      │
-┌─────────────┐  │           │                      │
-│ ESP32 Edge  │──┘           │                      │
-│   Nodes     │              │                      │
-└─────────────┘              │                      │
-                             │                      │
-                    ┌────────┴──────────┬───────────┘
-                    │                   │
-              ┌─────▼──────┐     ┌──────▼──────┐
-              │   Go TUI   │     │   M5Paper   │
-              │   Client   │     │   E-Ink     │
-              └────────────┘     └─────────────┘
+ESP32 nodes ──→ Mosquitto broker ──→ brain (Go daemon)
+                                          │
+                                    ┌─────┴──────┐
+                               TUI (Go)    M5Paper display
 ```
 
 ## Components
 
-### Component A: ESP32 Edge Nodes (ESP-IDF/C++)
-- **Path**: `esp32_edge/`
-- Reads moisture and temperature sensors
-- Publishes telemetry every 15 minutes
-- NVS-based provisioning with auto-assignment
-- Deep sleep capable for battery operation
+| Directory | Language | Role |
+|-----------|----------|------|
+| `brain/` | Go | Headless daemon — sole state manager, controller, alert emailer |
+| `tui/` | Go (bubbletea) | Terminal dashboard + provisioning UI |
+| `esp32_edge/` | C++ (ESP-IDF) | Sensor node: moisture, temperature, pump relay |
+| `m5paper_display/` | C++ (Arduino/PlatformIO) | E-ink status display |
+| `mosquitto/` | — | Eclipse Mosquitto broker config |
 
-### Component B: Go Brain Daemon
-- **Path**: `brain/`
-- Central state manager and config keeper
-- Listens to telemetry, tracks unprovisioned devices
-- Computes alert flags from thresholds
-- Publishes master state every 5 seconds
-- Handles provisioning workflow
-
-### Component C: Go TUI Client
-- **Path**: `tui/`
-- Terminal dashboard with Bubble Tea
-- Plant cards with color-coded alerts
-- Interactive provisioning form
-- Zero calculation logic (pure view)
-
-### Component D: M5Paper E-Ink Display
-- **Path**: `m5paper_display/`
-- E-ink dashboard for wall mounting
-- Deep sleep wake/update/sleep cycle
-- Battery powered portable display
-- Read-only state subscriber
-
-## MQTT Topics
+## MQTT topics
 
 | Topic | Direction | Purpose |
 |-------|-----------|---------|
 | `garden/telemetry` | Edge → Brain | Sensor readings |
-| `garden/setup` | Edge ↔ Brain | Provisioning broadcasts |
-| `garden/setup/{MAC}` | Brain → Edge | Device assignments |
-| `garden/admin` | TUI → Brain | Provisioning commands |
-| `garden/state` | Brain → All | Master state (5s ticker) |
+| `garden/setup` | Edge → Brain | Provisioning beacon |
+| `garden/setup/{MAC}` | Brain → Edge | Assign plant ID |
+| `garden/admin` | TUI → Brain | Provision new plant |
+| `garden/state` | Brain → All | Master state (retained, every 5 s) |
+| `garden/command/{id}` | Brain → Edge | `water_on` / `water_off` |
 
-## Quick Start
+## Prerequisites
 
-### 1. Start MQTT Broker
+- Docker (for Mosquitto)
+- Go ≥ 1.22 (brain + TUI)
+- ESP-IDF ≥ 5.1 (ESP32 firmware)
+- PlatformIO (M5Paper firmware)
+
+## Running
+
+### 1. Start the broker
+
 ```bash
-docker-compose up -d
+docker compose up -d
 ```
 
-### 2. Run Brain Daemon
+### 2. Start the brain
+
 ```bash
 cd brain
-go mod download
-go run main.go
+go run . -config config.yaml
 ```
 
-### 3. Run TUI Client
+Edit `brain/config.yaml` to set the broker address, plant thresholds, and
+optional email notifications. Plants can also be added at runtime via the TUI.
+
+### 3. Start the TUI
+
 ```bash
 cd tui
-go mod download
-go run main.go
+go run . --broker tcp://localhost:1883 --id herb-tui
 ```
 
-### 4. Flash ESP32 Edge Node
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--broker` | `tcp://localhost:1883` | MQTT broker address |
+| `--id` | `herb-tui` | MQTT client ID (change if running multiple TUI instances) |
+| `--debug` | off | Enable verbose MQTT logging to stdout/stderr |
+
+### 4. Flash an ESP32 node
+
 ```bash
 cd esp32_edge
-# Edit main.cpp with WiFi credentials and MQTT broker IP
-idf.py build
-idf.py -p /dev/ttyUSB0 flash monitor
+idf.py menuconfig          # set WiFi SSID/password, broker IP, pin assignments
+idf.py build flash monitor
 ```
 
-### 5. Flash M5Paper Display
+On first boot the node beacons every 10 s to `garden/setup`. Use the TUI to
+assign it a plant ID and thresholds. The assignment is persisted to NVS so it
+survives reboots.
+
+### 5. Flash the M5Stack Paper S3
+
+Edit the `#define` lines at the top of `m5paper_display/src/main.cpp`:
+
+```cpp
+#define WIFI_SSID      "your_ssid"
+#define WIFI_PASSWORD  "your_password"
+#define MQTT_BROKER    "192.168.1.100"
+```
+
+Then build and upload with PlatformIO:
+
 ```bash
 cd m5paper_display
-# Edit src/main.cpp with WiFi credentials and MQTT broker IP
 pio run --target upload
-pio device monitor
 ```
 
-## Provisioning Workflow
+## Using the TUI
 
-1. Flash ESP32 with blank NVS
-2. ESP32 broadcasts MAC to `garden/setup`
-3. Brain adds to unprovisioned list
-4. TUI shows alert banner
-5. User presses `p` and fills form:
-   - MAC address
-   - Plant ID (e.g., `thyme_1`)
-   - Moisture thresholds (min/max %)
-   - Temperature thresholds (min/max °C)
-6. Brain updates `config.yaml`
-7. Brain publishes assignment to `garden/setup/{MAC}`
-8. ESP32 saves Plant ID to NVS and restarts
-9. ESP32 enters telemetry mode
+### Main view
 
-## Configuration
+```
+Herb Garden Monitor  connected  updated 14:32:01
+────────────────────────────────────────────────────────────────────────
 
-### config.yaml
-```yaml
-broker:
-  address: "tcp://localhost:1883"
-  client_id: "garden_brain"
+PLANTS
 
-plants:
-  thyme_1:
-    min_moisture: 20
-    max_moisture: 40
-    min_temp: 18.0
-    max_temp: 25.0
+  Basil (herb-basil)                              32s ago
+  Moisture  47.3% [███████░░░░░░░]  Temp 21.4°C  Pump OFF
+
+  Mint (herb-mint)  ⚠ MOISTURE                   1m ago
+  Moisture  12.1% [██░░░░░░░░░░░░]  Temp 22.0°C  Pump ON (cooldown)
+
+UNPROVISIONED DEVICES
+
+  ▶ AA:BB:CC:DD:EE:FF
+
+────────────────────────────────────────────────────────────────────────
+[q] quit  [↑↓/jk] select  [p] provision
 ```
 
-## Constraints
+The header shows broker connection status and the time of the last state
+update received from the brain. Each plant card shows:
 
-- ✅ Local network only (air-gapped)
-- ✅ MQTT strictly (no HTTP REST)
-- ✅ ESP-IDF for ESP32 (no Arduino)
-- ✅ Flat YAML config (no database)
-- ✅ Hub-and-spoke architecture
-- ✅ Central state management in Brain
+| Field | Description |
+|-------|-------------|
+| Name (id) | Display name and plant ID |
+| `⚠ MOISTURE` / `⚠ TEMP` | Active alert badge |
+| Last seen | Time since last telemetry (`Xs ago`, `Xm ago`, or `offline`) |
+| Moisture % + bar | Current soil moisture with 14-cell visual bar |
+| Temp | Temperature in °C |
+| Pump | `Pump OFF`, `Pump ON`, or `Pump ON (cooldown)` |
 
-## State Message Schema
+### Main view keys
 
-```json
-{
-  "timestamp": 1700000000,
-  "plants": {
-    "thyme_1": {
-      "moisture": 35.0,
-      "temp": 22.5,
-      "moisture_alert": false,
-      "temp_alert": false
-    },
-    "lavender_1": {
-      "moisture": 45.0,
-      "temp": 21.0,
-      "moisture_alert": true,
-      "alert_msg": "Moisture 45.0% exceeds 40.0% max threshold"
-    }
-  },
-  "unprovisioned_devices": ["A1B2C3"]
-}
+| Key | Action |
+|-----|--------|
+| `q` / `Ctrl+C` | Quit |
+| `↑` / `k` | Move cursor up in unprovisioned device list |
+| `↓` / `j` | Move cursor down in unprovisioned device list |
+| `p` | Open provisioning form for the selected device |
+
+The unprovisioned section and navigation keys only appear when there are
+devices that have beaconed but not yet been assigned a plant ID.
+
+### Provisioning a new device
+
+Press `p` with an unprovisioned device selected to open the provisioning
+form. The MAC address of the device is shown at the top and is filled in
+automatically.
+
+| Field | Default | Notes |
+|-------|---------|-------|
+| Plant ID | — | Required. Letters, digits, `-` and `_` only. Used as the MQTT topic segment and config key. |
+| Display Name | — | Required. Human-readable label shown in TUI and on the e-ink display. |
+| Min Moisture % | `20` | Brain waters the plant when moisture drops below this value. |
+| Max Moisture % | `60` | Brain stops watering when moisture rises above this value. |
+| Min Temp °C | `15` | Temperature alert threshold (lower bound). |
+| Max Temp °C | `30` | Temperature alert threshold (upper bound). |
+| Cooldown (sec) | `1200` | Minimum time (20 min) between watering cycles to allow soil absorption. |
+
+**Provisioning form keys**
+
+| Key | Action |
+|-----|--------|
+| `Tab` / `↓` | Move to next field |
+| `Shift+Tab` / `↑` | Move to previous field |
+| `Enter` | Advance to next field; submit on the last field |
+| `Esc` | Cancel and return to main view |
+| `Ctrl+C` | Quit |
+
+On submit the TUI publishes to `garden/admin`. The brain stores the new
+plant in `brain/config.yaml` and the ESP32 node receives its plant ID via
+`garden/setup/{MAC}`, persisting it to NVS.
+
+### Testing without hardware
+
+You can exercise the full TUI + brain flow on a single machine with no
+ESP32 connected. Start the broker and brain, then follow these steps:
+
+**Step 1 — simulate an unprovisioned device beacon** (this is what an ESP32
+sends before it has been assigned a plant ID):
+
+```bash
+mosquitto_pub -h localhost -t garden/setup \
+  -m '{"mac":"AA:BB:CC:DD:EE:FF","status":"awaiting_provision"}'
 ```
 
-## Tech Stack
+The brain adds the MAC to its unprovisioned list and the TUI will show it
+under **UNPROVISIONED DEVICES** within the next state tick (≤ 5 s). Use
+`[↓/j]` to select it and `[p]` to open the provisioning form.
 
-- **Broker**: Eclipse Mosquitto (Docker)
-- **Edge**: ESP-IDF (C++/FreeRTOS)
-- **Brain**: Go + Paho MQTT
-- **TUI**: Go + Bubble Tea + Lipgloss
-- **Display**: PlatformIO (Arduino) + M5EPD
+**Step 2 — after provisioning, simulate telemetry** so the plant card
+appears in the **PLANTS** section:
 
-## License
+```bash
+mosquitto_pub -h localhost -t garden/telemetry \
+  -m '{"plant_id":"herb-test","moisture":35.0,"temp":22.5}'
+```
 
-MIT
+Replace `herb-test` with the plant ID you entered in the provisioning form.
+
+## Calibrating the moisture sensor
+
+The ESP32 firmware uses raw ADC counts to compute moisture percentage. The
+defaults (`DRY=3100`, `WET=1300`) suit a typical capacitive sensor at 3.3 V with
+12-bit resolution, but you should calibrate for your specific sensor:
+
+1. Run `idf.py monitor` and read the raw ADC values printed at boot.
+2. Record the value when the sensor is in dry air (`DRY`).
+3. Record the value when the sensor is submerged in water (`WET`).
+4. Update the constants in `esp32_edge/main/main.cpp` and reflash.
+
+## Email alerts
+
+Set `notifications.enabled: true` in `brain/config.yaml` and fill in your
+SMTP credentials. The brain sends de-duplicated alerts for:
+
+- Moisture or temperature out of range (CRITICAL / RESOLVED)
+- Pump activated (INFO, one-shot)
+- Edge node offline — no telemetry for `watchdog_minutes` (CRITICAL / RESOLVED)
+
+## Hardware wiring (defaults, configurable via `idf.py menuconfig`)
+
+| Signal | GPIO |
+|--------|------|
+| Capacitive moisture sensor (ADC1 ch 6) | GPIO 34 |
+| DS18B20 one-wire data (4.7 kΩ pull-up) | GPIO 4 |
+| Pump relay (active HIGH) | GPIO 26 |

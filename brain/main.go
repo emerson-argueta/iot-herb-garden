@@ -2,327 +2,160 @@ package main
 
 import (
 	"encoding/json"
+	"flag"
 	"fmt"
 	"log"
 	"os"
-	"sync"
+	"os/signal"
+	"syscall"
 	"time"
 
-	mqtt "github.com/eclipse/paho.mqtt.golang"
-	"gopkg.in/yaml.v3"
+	pahomqtt "github.com/eclipse/paho.mqtt.golang"
+	"github.com/iot-herb-garden/brain/internal/alertmanager"
+	"github.com/iot-herb-garden/brain/internal/config"
+	"github.com/iot-herb-garden/brain/internal/controller"
+	mqttclient "github.com/iot-herb-garden/brain/internal/mqtt"
+	"github.com/iot-herb-garden/brain/internal/notifier"
+	"github.com/iot-herb-garden/brain/internal/state"
 )
 
-// Config structures
-type BrokerConfig struct {
-	Address  string `yaml:"address"`
-	ClientID string `yaml:"client_id"`
-}
-
-type PlantThresholds struct {
-	MinMoisture float64 `yaml:"min_moisture"`
-	MaxMoisture float64 `yaml:"max_moisture"`
-	MinTemp     float64 `yaml:"min_temp"`
-	MaxTemp     float64 `yaml:"max_temp"`
-}
-
-type Config struct {
-	Broker BrokerConfig                `yaml:"broker"`
-	Plants map[string]PlantThresholds `yaml:"plants"`
-}
-
-// Telemetry message from edge nodes
-type TelemetryMessage struct {
-	PlantID  string  `json:"plant_id"`
-	Moisture float64 `json:"moisture"`
-	Temp     float64 `json:"temp"`
-}
-
-// Setup message from unprovisioned devices
-type SetupMessage struct {
-	MAC    string `json:"mac"`
-	Status string `json:"status"`
-}
-
-// Admin message from TUI
-type AdminMessage struct {
-	Action      string  `json:"action"`
-	MAC         string  `json:"mac"`
-	PlantID     string  `json:"plant_id"`
-	MinMoisture float64 `json:"min_moisture,string"`
-	MaxMoisture float64 `json:"max_moisture,string"`
-	MinTemp     float64 `json:"min_temp,string"`
-	MaxTemp     float64 `json:"max_temp,string"`
-}
-
-// Master state structures
-type PlantState struct {
-	Moisture      float64 `json:"moisture"`
-	Temp          float64 `json:"temp"`
-	MoistureAlert bool    `json:"moisture_alert"`
-	TempAlert     bool    `json:"temp_alert"`
-	AlertMsg      string  `json:"alert_msg,omitempty"`
-}
-
-type MasterState struct {
-	Timestamp             int64                  `json:"timestamp"`
-	Plants                map[string]PlantState  `json:"plants"`
-	UnprovisionedDevices  []string               `json:"unprovisioned_devices"`
-}
-
-// Brain daemon
-type Brain struct {
-	config                Config
-	configPath            string
-	client                mqtt.Client
-	telemetryCache        map[string]TelemetryMessage
-	unprovisionedDevices  map[string]bool
-	mu                    sync.RWMutex
-}
-
-func loadConfig(path string) (*Config, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-
-	var config Config
-	if err := yaml.Unmarshal(data, &config); err != nil {
-		return nil, err
-	}
-
-	return &config, nil
-}
-
-func (b *Brain) handleTelemetry(_ mqtt.Client, msg mqtt.Message) {
-	var telemetry TelemetryMessage
-	if err := json.Unmarshal(msg.Payload(), &telemetry); err != nil {
-		log.Printf("Failed to parse telemetry: %v", err)
-		return
-	}
-
-	b.mu.Lock()
-	b.telemetryCache[telemetry.PlantID] = telemetry
-	b.mu.Unlock()
-
-	log.Printf("Telemetry received: %s -> moisture=%.1f%%, temp=%.1f°C",
-		telemetry.PlantID, telemetry.Moisture, telemetry.Temp)
-}
-
-func (b *Brain) handleSetup(_ mqtt.Client, msg mqtt.Message) {
-	var setup SetupMessage
-	if err := json.Unmarshal(msg.Payload(), &setup); err != nil {
-		log.Printf("Failed to parse setup message: %v", err)
-		return
-	}
-
-	if setup.Status == "awaiting_provision" {
-		b.mu.Lock()
-		b.unprovisionedDevices[setup.MAC] = true
-		b.mu.Unlock()
-		log.Printf("Unprovisioned device detected: %s", setup.MAC)
-	}
-}
-
-func (b *Brain) handleAdmin(_ mqtt.Client, msg mqtt.Message) {
-	var admin AdminMessage
-	if err := json.Unmarshal(msg.Payload(), &admin); err != nil {
-		log.Printf("Failed to parse admin message: %v", err)
-		return
-	}
-
-	if admin.Action == "new_plant" {
-		log.Printf("Provisioning request: %s -> %s", admin.MAC, admin.PlantID)
-
-		// Update config in memory
-		b.mu.Lock()
-		b.config.Plants[admin.PlantID] = PlantThresholds{
-			MinMoisture: admin.MinMoisture,
-			MaxMoisture: admin.MaxMoisture,
-			MinTemp:     admin.MinTemp,
-			MaxTemp:     admin.MaxTemp,
-		}
-
-		// Remove from unprovisioned list
-		delete(b.unprovisionedDevices, admin.MAC)
-		b.mu.Unlock()
-
-		// Save config to disk
-		if err := b.saveConfig(); err != nil {
-			log.Printf("Failed to save config: %v", err)
-			return
-		}
-
-		// Send assignment to ESP32
-		assignPayload := map[string]string{
-			"assign_id": admin.PlantID,
-		}
-		assignJSON, _ := json.Marshal(assignPayload)
-
-		topic := fmt.Sprintf("garden/setup/%s", admin.MAC)
-		token := b.client.Publish(topic, 0, false, assignJSON)
-		token.Wait()
-
-		log.Printf("Assignment sent to %s: plant_id=%s", admin.MAC, admin.PlantID)
-	}
-}
-
-func (b *Brain) saveConfig() error {
-	b.mu.RLock()
-	defer b.mu.RUnlock()
-
-	data, err := yaml.Marshal(&b.config)
-	if err != nil {
-		return err
-	}
-
-	if err := os.WriteFile(b.configPath, data, 0644); err != nil {
-		return err
-	}
-
-	log.Printf("Config saved to %s", b.configPath)
-	return nil
-}
-
-func (b *Brain) generateMasterState() MasterState {
-	b.mu.RLock()
-	defer b.mu.RUnlock()
-
-	state := MasterState{
-		Timestamp:            time.Now().Unix(),
-		Plants:               make(map[string]PlantState),
-		UnprovisionedDevices: make([]string, 0),
-	}
-
-	// Build plant states with alert logic
-	for plantID, telemetry := range b.telemetryCache {
-		thresholds, exists := b.config.Plants[plantID]
-		if !exists {
-			continue
-		}
-
-		plantState := PlantState{
-			Moisture: telemetry.Moisture,
-			Temp:     telemetry.Temp,
-		}
-
-		// Check moisture alerts
-		if telemetry.Moisture < thresholds.MinMoisture {
-			plantState.MoistureAlert = true
-			plantState.AlertMsg = fmt.Sprintf("Moisture %.1f%% below minimum %.1f%%",
-				telemetry.Moisture, thresholds.MinMoisture)
-		} else if telemetry.Moisture > thresholds.MaxMoisture {
-			plantState.MoistureAlert = true
-			plantState.AlertMsg = fmt.Sprintf("Moisture %.1f%% exceeds %.1f%% max threshold",
-				telemetry.Moisture, thresholds.MaxMoisture)
-		}
-
-		// Check temperature alerts
-		if telemetry.Temp < thresholds.MinTemp {
-			plantState.TempAlert = true
-			if plantState.AlertMsg != "" {
-				plantState.AlertMsg += "; "
-			}
-			plantState.AlertMsg += fmt.Sprintf("Temperature %.1f°C below minimum %.1f°C",
-				telemetry.Temp, thresholds.MinTemp)
-		} else if telemetry.Temp > thresholds.MaxTemp {
-			plantState.TempAlert = true
-			if plantState.AlertMsg != "" {
-				plantState.AlertMsg += "; "
-			}
-			plantState.AlertMsg += fmt.Sprintf("Temperature %.1f°C exceeds %.1f°C max threshold",
-				telemetry.Temp, thresholds.MaxTemp)
-		}
-
-		state.Plants[plantID] = plantState
-	}
-
-	// Add unprovisioned devices
-	for mac := range b.unprovisionedDevices {
-		state.UnprovisionedDevices = append(state.UnprovisionedDevices, mac)
-	}
-
-	return state
-}
-
-func (b *Brain) publishState() {
-	state := b.generateMasterState()
-
-	payload, err := json.Marshal(state)
-	if err != nil {
-		log.Printf("Failed to marshal state: %v", err)
-		return
-	}
-
-	token := b.client.Publish("garden/state", 0, false, payload)
-	token.Wait()
-
-	log.Printf("Published master state: %d plants, %d unprovisioned devices",
-		len(state.Plants), len(state.UnprovisionedDevices))
-}
-
-func (b *Brain) stateTicker() {
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-
-	for range ticker.C {
-		b.publishState()
-	}
-}
+const (
+	topicTelemetry = "garden/telemetry"
+	topicSetup     = "garden/setup"
+	topicAdmin     = "garden/admin"
+	topicState     = "garden/state"
+	tickInterval   = 5 * time.Second
+)
 
 func main() {
-	// Load config
-	config, err := loadConfig("config.yaml")
+	cfgPath := flag.String("config", "config.yaml", "path to config.yaml")
+	flag.Parse()
+
+	log.SetFlags(log.Ltime | log.Lshortfile)
+	log.Println("[brain] starting herb garden brain daemon")
+
+	cfg, err := config.Load(*cfgPath)
 	if err != nil {
-		log.Fatalf("Failed to load config: %v", err)
+		fmt.Fprintf(os.Stderr, "fatal: %v\n", err)
+		os.Exit(1)
+	}
+	log.Printf("[brain] loaded config: %d plant(s) defined", len(cfg.Plants))
+
+	store := state.NewStore()
+	ctrl := controller.New()
+	alerts := buildAlertManager(cfg)
+
+	client, err := mqttclient.NewClient(
+		mqttclient.WithBroker(cfg.MQTT.Broker),
+		mqttclient.WithClientID(cfg.MQTT.ClientID),
+		mqttclient.WithCredentials(cfg.MQTT.Username, cfg.MQTT.Password),
+	)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "fatal: %v\n", err)
+		os.Exit(1)
+	}
+	defer client.Disconnect(500)
+
+	subs := []struct {
+		topic   string
+		handler func() error
+	}{
+		{
+			topic: topicTelemetry,
+			handler: func() error {
+				return mqttclient.Subscribe(client, topicTelemetry, 1,
+					mqttclient.HandleTelemetry(ctrl, store, cfg, client))
+			},
+		},
+		{
+			topic: topicSetup,
+			handler: func() error {
+				return mqttclient.Subscribe(client, topicSetup, 1,
+					mqttclient.HandleSetup(store))
+			},
+		},
+		{
+			topic: topicAdmin,
+			handler: func() error {
+				return mqttclient.Subscribe(client, topicAdmin, 1,
+					mqttclient.HandleAdmin(client, store, ctrl, cfg, *cfgPath))
+			},
+		},
 	}
 
-	log.Printf("Loaded config: %d plants configured", len(config.Plants))
-
-	// Create brain instance
-	brain := &Brain{
-		config:               *config,
-		configPath:           "config.yaml",
-		telemetryCache:       make(map[string]TelemetryMessage),
-		unprovisionedDevices: make(map[string]bool),
+	for _, s := range subs {
+		if err := s.handler(); err != nil {
+			fmt.Fprintf(os.Stderr, "fatal: %v\n", err)
+			os.Exit(1)
+		}
 	}
 
-	// Setup MQTT client
-	opts := mqtt.NewClientOptions()
-	opts.AddBroker(config.Broker.Address)
-	opts.SetClientID(config.Broker.ClientID)
-	opts.SetAutoReconnect(true)
-	opts.SetOnConnectHandler(func(c mqtt.Client) {
-		log.Println("Connected to MQTT broker")
+	ticker := time.NewTicker(tickInterval)
+	defer ticker.Stop()
 
-		// Subscribe to telemetry
-		if token := c.Subscribe("garden/telemetry", 0, brain.handleTelemetry); token.Wait() && token.Error() != nil {
-			log.Fatalf("Failed to subscribe to telemetry: %v", token.Error())
+	go func() {
+		for range ticker.C {
+			publishState(client, store)
+			// AlertManager runs in the same tick goroutine after state is
+			// published. It never blocks the MQTT message handler goroutines.
+			alerts.Check(store)
 		}
-		log.Println("Subscribed to garden/telemetry")
+	}()
 
-		// Subscribe to setup
-		if token := c.Subscribe("garden/setup", 0, brain.handleSetup); token.Wait() && token.Error() != nil {
-			log.Fatalf("Failed to subscribe to setup: %v", token.Error())
-		}
-		log.Println("Subscribed to garden/setup")
+	log.Println("[brain] running — press Ctrl+C to stop")
 
-		// Subscribe to admin
-		if token := c.Subscribe("garden/admin", 0, brain.handleAdmin); token.Wait() && token.Error() != nil {
-			log.Fatalf("Failed to subscribe to admin: %v", token.Error())
-		}
-		log.Println("Subscribed to garden/admin")
-	})
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
 
-	brain.client = mqtt.NewClient(opts)
-	if token := brain.client.Connect(); token.Wait() && token.Error() != nil {
-		log.Fatalf("Failed to connect to broker: %v", token.Error())
+	log.Println("[brain] shutting down")
+}
+
+// buildAlertManager constructs the AlertManager from config, selecting a real
+// EmailNotifier when notifications are enabled or a NopNotifier otherwise.
+func buildAlertManager(cfg *config.Config) *alertmanager.AlertManager {
+	n := cfg.Notifications
+
+	var notif notifier.Notifier
+	if n.Enabled {
+		notif = notifier.NewEmailNotifier(notifier.EmailConfig{
+			Host:      n.SMTPHost,
+			Port:      n.SMTPPort,
+			Username:  n.Username,
+			Password:  n.Password,
+			From:      n.From,
+			Recipient: n.Recipient,
+		})
+		log.Printf("[brain] notifications enabled → %s", n.Recipient)
+	} else {
+		notif = notifier.NopNotifier{}
+		log.Println("[brain] notifications disabled (set notifications.enabled: true to activate)")
 	}
 
-	log.Println("Garden Brain daemon started")
+	return alertmanager.New(notif, alertmanager.Config{
+		ReNotifyInterval: n.ReNotifyInterval(),
+		WatchdogTimeout:  n.WatchdogTimeout(),
+	}, cfg.Plants)
+}
 
-	// Start state ticker
-	go brain.stateTicker()
+// publishState assembles the master snapshot from the store and publishes it.
+// No evaluation logic lives here — all enrichment happens in HandleTelemetry.
+func publishState(client pahomqtt.Client, store *state.Store) {
+	payload := store.BuildStatePayload()
 
-	// Keep running
-	select {}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		log.Printf("[tick] marshal error: %v", err)
+		return
+	}
+
+	token := client.Publish(topicState, 1, true, data)
+	token.Wait()
+	if err := token.Error(); err != nil {
+		log.Printf("[tick] publish error: %v", err)
+		return
+	}
+
+	log.Printf("[tick] published state: %d plant(s), %d unprovisioned",
+		len(payload.Plants), len(payload.UnprovisionedDevices))
 }

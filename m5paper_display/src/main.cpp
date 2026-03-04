@@ -1,309 +1,355 @@
 /*
- * M5Stack Paper S3 E-Ink Display
- * Hub-and-Spoke IoT Herb Garden Monitor
+ * herb-display — M5Stack Paper S3 e-ink display node
+ *
+ * Subscribes to garden/state (retained, published every 5 s by the brain)
+ * and renders a plant-status dashboard on the 960×540 e-ink screen.
+ *
+ * Display strategy
+ *   Full refresh  : on boot and whenever the plant list changes (rare)
+ *   Partial update: whenever sensor values change between ticks (common)
+ *   No refresh    : when nothing has changed (preserves display lifetime)
+ *
+ * Configuration: edit the #defines below before flashing.
  */
 
-#include <M5EPD.h>
+#include <Arduino.h>
+#include <M5Unified.h>
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
+#include <map>
+#include <vector>
+#include <string>
+#include <algorithm>
+#include <ctime>
 
-// Configuration
-const char* WIFI_SSID = "YOUR_WIFI_SSID";
-const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
-const char* MQTT_BROKER = "192.168.1.100";
-const int MQTT_PORT = 1883;
+// ── User configuration ────────────────────────────────────────────────────────
 
-// Sleep configuration (15 minutes)
-#define DEEP_SLEEP_SECONDS 900
-#define uS_TO_S_FACTOR 1000000ULL
+#define WIFI_SSID       "your_ssid"
+#define WIFI_PASSWORD   "your_password"
+#define MQTT_BROKER     "192.168.1.100"
+#define MQTT_PORT       1883
+#define MQTT_CLIENT_ID  "herb-display"
+#define TOPIC_STATE     "garden/state"
 
-// Display dimensions
-#define SCREEN_WIDTH 540
-#define SCREEN_HEIGHT 960
+// ── Display dimensions (M5Stack Paper S3) ────────────────────────────────────
 
-// Global objects
-M5EPD_Canvas canvas(&M5.EPD);
-WiFiClient wifiClient;
-PubSubClient mqttClient(wifiClient);
+static constexpr int SCREEN_W = 960;
+static constexpr int SCREEN_H = 540;
 
-// State tracking
-bool stateReceived = false;
-StaticJsonDocument<4096> stateDoc;
+// ── JSON payload shapes (mirror brain's garden/state) ─────────────────────────
 
-// Function declarations
-void connectWiFi();
-void connectMQTT();
-void mqttCallback(char* topic, byte* payload, unsigned int length);
-void drawDashboard();
-void drawPlantCard(int x, int y, int w, int h, const char* plantId, JsonObject state);
-void drawUnprovisionedAlert(JsonArray devices);
-void enterDeepSleep();
+struct PlantState {
+    String display_name;
+    float  moisture      = 0;
+    float  temp          = 0;
+    bool   watering      = false;
+    bool   in_cooldown   = false;
+    bool   moisture_alert = false;
+    bool   temp_alert    = false;
+    String alert_msg;
+    int64_t last_seen    = 0;   // unix timestamp
+};
 
-void setup() {
-    Serial.begin(115200);
-    Serial.println("M5Paper Display starting...");
+struct StatePayload {
+    int64_t                   timestamp = 0;
+    std::map<String, PlantState> plants;
+    std::vector<String>       unprovisioned;
+};
 
-    // Initialize M5Paper
-    M5.begin();
-    M5.EPD.SetRotation(0);
-    M5.EPD.Clear(true);
-    M5.RTC.begin();
+// ── Global state ──────────────────────────────────────────────────────────────
 
-    // Create canvas
-    canvas.createCanvas(SCREEN_WIDTH, SCREEN_HEIGHT);
-    canvas.setTextSize(3);
+static WiFiClient   s_wifi_client;
+static PubSubClient s_mqtt(s_wifi_client);
+static StatePayload s_current;
+static StatePayload s_last_drawn;
+static bool         s_needs_draw   = false;
+static bool         s_full_refresh = true;   // force full refresh on boot
 
-    // Show loading screen
-    canvas.fillCanvas(0);
-    canvas.setTextColor(15);
-    canvas.drawString("IoT Herb Garden", 20, 20);
-    canvas.drawString("Connecting...", 20, 60);
-    canvas.pushCanvas(0, 0, UPDATE_MODE_GC16);
+// ── Connectivity helpers ──────────────────────────────────────────────────────
 
-    // Connect to WiFi
-    connectWiFi();
-
-    // Connect to MQTT
-    mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
-    mqttClient.setCallback(mqttCallback);
-    mqttClient.setBufferSize(4096);
-    connectMQTT();
-
-    // Subscribe to garden/state
-    mqttClient.subscribe("garden/state");
-    Serial.println("Subscribed to garden/state");
-
-    // Wait for state update (timeout after 30 seconds)
-    unsigned long startTime = millis();
-    while (!stateReceived && (millis() - startTime < 30000)) {
-        mqttClient.loop();
-        delay(100);
-    }
-
-    if (stateReceived) {
-        Serial.println("State received, drawing dashboard");
-        drawDashboard();
-    } else {
-        Serial.println("Timeout waiting for state");
-        canvas.fillCanvas(0);
-        canvas.setTextColor(15);
-        canvas.drawString("No data received", 20, 20);
-        canvas.drawString("Check MQTT broker", 20, 60);
-        canvas.pushCanvas(0, 0, UPDATE_MODE_GC16);
-    }
-
-    // Disconnect and sleep
-    mqttClient.disconnect();
-    WiFi.disconnect(true);
-    WiFi.mode(WIFI_OFF);
-
-    enterDeepSleep();
-}
-
-void loop() {
-    // Never reached due to deep sleep
-}
-
-void connectWiFi() {
-    Serial.print("Connecting to WiFi: ");
-    Serial.println(WIFI_SSID);
-
+static void wifi_connect()
+{
+    Serial.printf("[wifi] connecting to %s\n", WIFI_SSID);
     WiFi.mode(WIFI_STA);
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-
-    int attempts = 0;
-    while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    while (WiFi.status() != WL_CONNECTED) {
         delay(500);
         Serial.print(".");
-        attempts++;
     }
-
-    if (WiFi.status() == WL_CONNECTED) {
-        Serial.println("\nWiFi connected");
-        Serial.print("IP: ");
-        Serial.println(WiFi.localIP());
-    } else {
-        Serial.println("\nWiFi connection failed!");
-    }
+    Serial.printf("\n[wifi] connected, IP: %s\n",
+                  WiFi.localIP().toString().c_str());
 }
 
-void connectMQTT() {
-    Serial.print("Connecting to MQTT broker...");
+static void mqtt_subscribe()
+{
+    s_mqtt.subscribe(TOPIC_STATE, 1);
+    Serial.printf("[mqtt] subscribed to %s\n", TOPIC_STATE);
+}
 
-    String clientId = "m5paper_" + String((uint32_t)ESP.getEfuseMac(), HEX);
-
-    int attempts = 0;
-    while (!mqttClient.connected() && attempts < 10) {
-        if (mqttClient.connect(clientId.c_str())) {
-            Serial.println(" connected!");
+static void mqtt_reconnect()
+{
+    while (!s_mqtt.connected()) {
+        Serial.println("[mqtt] connecting…");
+        if (s_mqtt.connect(MQTT_CLIENT_ID)) {
+            Serial.println("[mqtt] connected");
+            mqtt_subscribe();
         } else {
-            Serial.print(".");
-            delay(1000);
-            attempts++;
+            Serial.printf("[mqtt] failed (rc=%d), retry in 5 s\n",
+                          s_mqtt.state());
+            delay(5000);
+        }
+    }
+}
+
+// ── JSON parsing ──────────────────────────────────────────────────────────────
+
+static StatePayload parse_state(const uint8_t *payload, unsigned int len)
+{
+    StatePayload out;
+    JsonDocument doc;
+    if (deserializeJson(doc, payload, len) != DeserializationError::Ok)
+        return out;
+
+    out.timestamp = doc["timestamp"].as<int64_t>();
+
+    JsonObject plants = doc["plants"].as<JsonObject>();
+    for (JsonPair kv : plants) {
+        PlantState ps;
+        ps.display_name   = kv.value()["display_name"]   | "";
+        ps.moisture       = kv.value()["moisture"]       | 0.0f;
+        ps.temp           = kv.value()["temp"]           | 0.0f;
+        ps.watering       = kv.value()["watering"]       | false;
+        ps.in_cooldown    = kv.value()["in_cooldown"]    | false;
+        ps.moisture_alert = kv.value()["moisture_alert"] | false;
+        ps.temp_alert     = kv.value()["temp_alert"]     | false;
+        ps.alert_msg      = kv.value()["alert_msg"]      | "";
+        ps.last_seen      = kv.value()["last_seen"]      | (int64_t)0;
+        out.plants[String(kv.key().c_str())] = ps;
+    }
+
+    JsonArray unprov = doc["unprovisioned_devices"].as<JsonArray>();
+    for (JsonVariant v : unprov) {
+        out.unprovisioned.push_back(v.as<String>());
+    }
+    return out;
+}
+
+// ── Plant list changed? ───────────────────────────────────────────────────────
+
+static bool plant_list_changed(const StatePayload &a, const StatePayload &b)
+{
+    if (a.plants.size() != b.plants.size()) return true;
+    for (auto &kv : a.plants) {
+        if (b.plants.find(kv.first) == b.plants.end()) return true;
+    }
+    return false;
+}
+
+// ── MQTT callback ─────────────────────────────────────────────────────────────
+
+static void on_message(const char *topic, uint8_t *payload, unsigned int len)
+{
+    if (strcmp(topic, TOPIC_STATE) != 0) return;
+
+    StatePayload incoming = parse_state(payload, len);
+    if (plant_list_changed(s_current, incoming)) {
+        s_full_refresh = true;
+    }
+    s_current   = incoming;
+    s_needs_draw = true;
+}
+
+// ── Rendering ─────────────────────────────────────────────────────────────────
+
+static String ago_str(int64_t unix_ts)
+{
+    if (unix_ts == 0) return "never";
+    int64_t now = (int64_t)time(nullptr);
+    int64_t d   = now - unix_ts;
+    if (d < 0)   d = 0;
+    if (d < 60)  return String(d) + "s ago";
+    if (d < 3600) return String(d / 60) + "m ago";
+    return "offline";
+}
+
+/*
+ * Draw a filled rectangle moisture bar.
+ * x, y = top-left; w = total width; h = height; pct = 0..100
+ */
+static void draw_moisture_bar(M5Canvas &cv, int x, int y, int w, int h,
+                              float pct, bool alert)
+{
+    cv.drawRect(x, y, w, h, TFT_BLACK);
+    int filled = (int)(pct / 100.0f * (float)(w - 2));
+    if (filled > 0) {
+        uint16_t col = alert ? TFT_BLACK : TFT_DARKGRAY;
+        cv.fillRect(x + 1, y + 1, filled, h - 2, col);
+    }
+}
+
+static void render(bool full)
+{
+    // M5Unified canvas for flicker-free drawing.
+    M5Canvas cv(&M5.Display);
+    cv.setColorDepth(1);   // 1-bit for e-ink
+    cv.createSprite(SCREEN_W, SCREEN_H);
+    cv.fillSprite(TFT_WHITE);
+
+    // ── Header ────────────────────────────────────────────────────────────────
+    cv.setTextSize(2);
+    cv.setTextColor(TFT_BLACK);
+    cv.drawString("Herb Garden", 20, 14);
+
+    // Timestamp
+    char ts_buf[32];
+    struct tm tm_info;
+    time_t now = time(nullptr);
+    localtime_r(&now, &tm_info);
+    strftime(ts_buf, sizeof(ts_buf), "%H:%M:%S", &tm_info);
+    cv.setTextSize(1);
+    cv.drawString(ts_buf, SCREEN_W - 90, 20);
+
+    cv.drawLine(0, 44, SCREEN_W, 44, TFT_BLACK);
+
+    // ── Plant cards ───────────────────────────────────────────────────────────
+    // Collect sorted plant IDs.
+    std::vector<String> ids;
+    for (auto &kv : s_current.plants) ids.push_back(kv.first);
+    std::sort(ids.begin(), ids.end());
+
+    constexpr int CARD_H  = 110;
+    constexpr int CARD_W  = SCREEN_W - 40;
+    constexpr int CARD_X  = 20;
+    constexpr int CARD_Y0 = 54;
+    constexpr int CARD_PAD = 8;
+    constexpr int BAR_W   = 200;
+    constexpr int BAR_H   = 16;
+
+    if (ids.empty()) {
+        cv.setTextSize(1);
+        cv.drawString("Waiting for data from brain...", CARD_X, CARD_Y0 + 20);
+    }
+
+    for (int i = 0; i < (int)ids.size(); i++) {
+        const String    &id = ids[i];
+        const PlantState &ps = s_current.plants.at(id);
+        int y = CARD_Y0 + i * (CARD_H + 6);
+
+        // Card border
+        cv.drawRect(CARD_X, y, CARD_W, CARD_H, TFT_BLACK);
+
+        // Plant name: "Display Name (plant_id)" or just "plant_id"
+        cv.setTextSize(2);
+        String heading = ps.display_name.length() > 0
+            ? ps.display_name + " (" + id + ")"
+            : id;
+        cv.drawString(heading, CARD_X + CARD_PAD, y + CARD_PAD);
+
+        // Last-seen
+        cv.setTextSize(1);
+        String ago = ago_str(ps.last_seen);
+        cv.drawString(ago, CARD_W - 80, y + CARD_PAD + 4);
+
+        // Moisture label + bar + value
+        int row1 = y + CARD_PAD + 28;
+        cv.drawString("Moisture:", CARD_X + CARD_PAD, row1);
+        draw_moisture_bar(cv, CARD_X + 90, row1, BAR_W, BAR_H,
+                          ps.moisture, ps.moisture_alert);
+        char mbuf[16];
+        snprintf(mbuf, sizeof(mbuf), "%.1f%%", ps.moisture);
+        cv.drawString(mbuf, CARD_X + 90 + BAR_W + 6, row1);
+        if (ps.moisture_alert) {
+            cv.drawString("!", CARD_X + 90 + BAR_W + 50, row1);
+        }
+
+        // Temperature
+        int row2 = row1 + 22;
+        char tbuf[24];
+        snprintf(tbuf, sizeof(tbuf), "Temp: %.1f C", ps.temp);
+        cv.drawString(tbuf, CARD_X + CARD_PAD, row2);
+        if (ps.temp_alert) cv.drawString("!", CARD_X + 120, row2);
+
+        // Pump status
+        int row3 = row2 + 22;
+        if (ps.watering) {
+            String pump_str = ps.in_cooldown ? "Pump ON (cooldown)" : "Pump ON";
+            cv.drawString(pump_str, CARD_X + CARD_PAD, row3);
+        } else {
+            cv.drawString("Pump OFF", CARD_X + CARD_PAD, row3);
+        }
+
+        // Alert message (if any)
+        if (ps.alert_msg.length() > 0) {
+            cv.drawString(ps.alert_msg, CARD_X + CARD_W / 2, row3);
         }
     }
 
-    if (!mqttClient.connected()) {
-        Serial.println("\nMQTT connection failed!");
-    }
-}
-
-void mqttCallback(char* topic, byte* payload, unsigned int length) {
-    Serial.print("Message received on topic: ");
-    Serial.println(topic);
-
-    // Parse JSON
-    DeserializationError error = deserializeJson(stateDoc, payload, length);
-
-    if (error) {
-        Serial.print("JSON parsing failed: ");
-        Serial.println(error.c_str());
-        return;
-    }
-
-    stateReceived = true;
-    Serial.println("State parsed successfully");
-}
-
-void drawDashboard() {
-    canvas.fillCanvas(0);
-    canvas.setTextColor(15);
-
-    // Header
-    canvas.setTextSize(4);
-    canvas.drawString("Herb Garden Monitor", 20, 20);
-
-    // Draw timestamp
-    long timestamp = stateDoc["timestamp"];
-    canvas.setTextSize(2);
-    char timeStr[64];
-    snprintf(timeStr, sizeof(timeStr), "Updated: %ld", timestamp);
-    canvas.drawString(timeStr, 20, 70);
-
-    // Check for unprovisioned devices
-    JsonArray unprovisionedDevices = stateDoc["unprovisioned_devices"];
-    if (unprovisionedDevices.size() > 0) {
-        drawUnprovisionedAlert(unprovisionedDevices);
-    }
-
-    // Draw plant cards
-    JsonObject plants = stateDoc["plants"];
-    int plantCount = plants.size();
-
-    if (plantCount == 0) {
-        canvas.setTextSize(3);
-        canvas.drawString("No plants configured", 20, 200);
-    } else {
-        int cardWidth = 250;
-        int cardHeight = 180;
-        int padding = 20;
-        int startY = 140;
-
-        int row = 0;
-        int col = 0;
-
-        for (JsonPair kv : plants) {
-            const char* plantId = kv.key().c_str();
-            JsonObject plantState = kv.value();
-
-            int x = padding + col * (cardWidth + padding);
-            int y = startY + row * (cardHeight + padding);
-
-            drawPlantCard(x, y, cardWidth, cardHeight, plantId, plantState);
-
-            col++;
-            if (col >= 2) {
-                col = 0;
-                row++;
-            }
+    // ── Unprovisioned devices ─────────────────────────────────────────────────
+    if (!s_current.unprovisioned.empty()) {
+        int uy = CARD_Y0 + (int)ids.size() * (CARD_H + 6);
+        cv.setTextSize(1);
+        cv.drawString("Unprovisioned:", CARD_X, uy);
+        uy += 16;
+        for (auto &mac : s_current.unprovisioned) {
+            cv.drawString(mac, CARD_X + 10, uy);
+            uy += 14;
         }
     }
 
-    // Push to screen
-    canvas.pushCanvas(0, 0, UPDATE_MODE_GC16);
-    Serial.println("Dashboard drawn");
+    // Push sprite to display.
+    // Full refresh (epd_quality) clears to white then redraws — use on boot or
+    // when layout changes.  Fast/partial (epd_fast) updates only changed pixels
+    // with no white flash — use for routine value updates.
+    M5.Display.setEpdMode(full ? epd_mode_t::epd_quality : epd_mode_t::epd_fast);
+    M5.Display.waitDisplay();
+    cv.pushSprite(0, 0);
+
+    cv.deleteSprite();
 }
 
-void drawPlantCard(int x, int y, int w, int h, const char* plantId, JsonObject state) {
-    // Draw border
-    canvas.drawRect(x, y, w, h, 15);
+// ── Arduino entry points ──────────────────────────────────────────────────────
 
-    // Plant name
-    canvas.setTextSize(3);
-    canvas.setTextColor(15);
-    canvas.drawString(plantId, x + 10, y + 10);
+void setup()
+{
+    auto cfg = M5.config();
+    M5.begin(cfg);
 
-    // Moisture
-    float moisture = state["moisture"];
-    bool moistureAlert = state["moisture_alert"];
+    Serial.begin(115200);
+    Serial.println("[herb-display] booting");
 
-    canvas.setTextSize(2);
-    char moistureStr[32];
-    snprintf(moistureStr, sizeof(moistureStr), "Moisture: %.1f%%", moisture);
+    // E-ink orientation: landscape.  EPD mode is set per-render, not globally.
+    M5.Display.setRotation(1);
 
-    if (moistureAlert) {
-        // Draw alert indicator (filled rect)
-        canvas.fillRect(x + 5, y + 50, 5, 20, 15);
-    }
-    canvas.drawString(moistureStr, x + 15, y + 50);
+    // Splash while connecting
+    M5.Display.setTextSize(2);
+    M5.Display.drawString("Herb Garden", 20, 20);
+    M5.Display.setTextSize(1);
+    M5.Display.drawString("Connecting...", 20, 60);
 
-    // Temperature
-    float temp = state["temp"];
-    bool tempAlert = state["temp_alert"];
+    wifi_connect();
 
-    char tempStr[32];
-    snprintf(tempStr, sizeof(tempStr), "Temp: %.1f C", temp);
+    // Sync clock via SNTP so timestamps make sense.
+    configTime(0, 0, "pool.ntp.org");
 
-    if (tempAlert) {
-        // Draw alert indicator
-        canvas.fillRect(x + 5, y + 80, 5, 20, 15);
-    }
-    canvas.drawString(tempStr, x + 15, y + 80);
+    s_mqtt.setServer(MQTT_BROKER, MQTT_PORT);
+    s_mqtt.setCallback(on_message);
+    s_mqtt.setBufferSize(4096);   // garden/state can be large with many plants
+    mqtt_reconnect();
 
-    // Alert message
-    if (state.containsKey("alert_msg")) {
-        const char* alertMsg = state["alert_msg"];
-        canvas.setTextSize(1);
-        canvas.drawString("Alert:", x + 10, y + 115);
-
-        // Word wrap alert message
-        String msg = String(alertMsg);
-        int maxWidth = w - 20;
-        int lineHeight = 18;
-        int currentY = y + 135;
-
-        // Simple word wrap (truncate if too long)
-        if (msg.length() > 40) {
-            msg = msg.substring(0, 37) + "...";
-        }
-        canvas.drawString(msg.c_str(), x + 10, currentY);
-    }
+    Serial.println("[herb-display] ready");
 }
 
-void drawUnprovisionedAlert(JsonArray devices) {
-    // Draw alert banner
-    int bannerY = 100;
-    int bannerHeight = 30;
+void loop()
+{
+    if (WiFi.status() != WL_CONNECTED) wifi_connect();
+    if (!s_mqtt.connected()) mqtt_reconnect();
+    s_mqtt.loop();
 
-    canvas.fillRect(0, bannerY, SCREEN_WIDTH, bannerHeight, 10);
-    canvas.setTextSize(2);
-    canvas.setTextColor(0);
-
-    char alertText[128];
-    snprintf(alertText, sizeof(alertText), "! %d Unprovisioned Device(s)",
-             devices.size());
-    canvas.drawString(alertText, 20, bannerY + 5);
-
-    canvas.setTextColor(15);
-}
-
-void enterDeepSleep() {
-    Serial.println("Entering deep sleep for 15 minutes...");
-
-    // Configure wake up source
-    esp_sleep_enable_timer_wakeup(DEEP_SLEEP_SECONDS * uS_TO_S_FACTOR);
-
-    // Enter deep sleep
-    M5.shutdown();
+    if (s_needs_draw) {
+        s_needs_draw = false;
+        render(s_full_refresh);
+        s_full_refresh = false;
+        s_last_drawn   = s_current;
+    }
 }

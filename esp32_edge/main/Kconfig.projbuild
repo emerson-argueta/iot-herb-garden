@@ -1,0 +1,51 @@
+menu "Herb Garden Edge Config"
+
+    config WIFI_SSID
+        string "WiFi SSID"
+        default "my_ssid"
+        help
+            SSID of the WiFi network to connect to.
+
+    config WIFI_PASSWORD
+        string "WiFi Password"
+        default "my_password"
+        help
+            Password for the WiFi network.
+
+    config MQTT_BROKER_URI
+        string "MQTT Broker URI"
+        default "mqtt://192.168.1.100:1883"
+        help
+            Full URI of the MQTT broker (e.g. mqtt://192.168.1.100:1883).
+
+    config MOISTURE_ADC_CHANNEL
+        int "Moisture sensor ADC1 channel (0-9)"
+        default 6
+        help
+            ADC1 channel connected to the capacitive soil moisture sensor.
+            Channel 6 corresponds to GPIO34 on the ESP32.
+
+    config ONEWIRE_GPIO
+        int "DS18B20 one-wire GPIO number"
+        default 4
+        help
+            GPIO pin wired to the DS18B20 temperature sensor data line.
+            Requires a 4.7 kΩ pull-up resistor to 3.3 V.
+
+    config PUMP_GPIO
+        int "Pump relay GPIO number"
+        default 26
+        help
+            GPIO pin that drives the pump relay (active HIGH).
+
+    config PUMP_MAX_ON_SECONDS
+        int "Pump safety cut-off (seconds)"
+        default 300
+        help
+            Maximum time the pump may run continuously before the firmware
+            forces it off, regardless of MQTT commands.  This guards against
+            brain crashes, MQTT disconnects, or stuck relays.  The brain can
+            turn the pump on again after the cut-off if the soil is still dry.
+            Default: 300 s (5 minutes).
+
+endmenu
