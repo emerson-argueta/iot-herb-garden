@@ -237,3 +237,8 @@ SMTP credentials. The brain sends de-duplicated alerts for:
 | Capacitive moisture sensor (ADC1 ch 6) | GPIO 34 |
 | DS18B20 one-wire data (4.7 kΩ pull-up) | GPIO 4 |
 | Pump relay (active HIGH) | GPIO 26 |
+
+## License
+
+This project is licensed under the GNU General Public License v3.0.
+See the LICENSE file for details.
