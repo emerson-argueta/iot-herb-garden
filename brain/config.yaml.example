@@ -1,0 +1,24 @@
+mqtt:
+    broker: tcp://localhost:1883
+    client_id: herb-brain
+    username: ""
+    password: ""
+notifications:
+    enabled: false
+    smtp_host: smtp.gmail.com
+    smtp_port: 587
+    username: your_email@gmail.com
+    password: 'your_google_app_password'
+    from: Herb Garden <your_email@gmail.com>
+    recipient: your_email@gmail.com
+    re_notify_hours: 4
+    watchdog_minutes: 20
+plants:
+    herb_1:
+        display_name: My Herb
+        mac: AA:BB:CC:DD:EE:FF
+        min_moisture: 20
+        max_moisture: 60
+        min_temp: 15
+        max_temp: 30
+        cooldown_seconds: 1200
