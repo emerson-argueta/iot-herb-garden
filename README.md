@@ -47,13 +47,21 @@ docker compose up -d
 
 ### 2. Start the brain
 
+Copy the example config and edit it before first run:
+
+```bash
+cp brain/config.yaml.example brain/config.yaml
+```
+
+`brain/config.yaml` is gitignored — it holds your local thresholds and SMTP
+credentials and will never be committed. Edit it to set the broker address,
+plant thresholds, and optional email notifications. Plants can also be added
+at runtime via the TUI.
+
 ```bash
 cd brain
 go run . -config config.yaml
 ```
-
-Edit `brain/config.yaml` to set the broker address, plant thresholds, and
-optional email notifications. Plants can also be added at runtime via the TUI.
 
 ### 3. Start the TUI
 
