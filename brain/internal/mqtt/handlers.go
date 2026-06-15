@@ -70,7 +70,7 @@ func HandleTelemetry(
 		}
 		store.UpdateTelemetry(t)
 
-		plantCfg, ok := cfg.Plants[p.PlantID]
+		plantCfg, ok := cfg.GetPlant(p.PlantID)
 		if !ok {
 			log.Printf("[telemetry] no config for plant_id %q, ignoring", p.PlantID)
 			return
@@ -82,6 +82,7 @@ func HandleTelemetry(
 			MinTemp:        plantCfg.MinTemp,
 			MaxTemp:        plantCfg.MaxTemp,
 			CooldownPeriod: plantCfg.CooldownPeriod(),
+			MaxWaterPeriod: plantCfg.MaxWaterPeriod(),
 		}
 
 		store.SetDisplayName(p.PlantID, plantCfg.DisplayName)
@@ -97,12 +98,19 @@ func HandleTelemetry(
 			if decision.Watering {
 				action = "water_on"
 			}
-			cmd, _ := json.Marshal(domain.Command{PlantID: p.PlantID, Action: action})
-			topic := fmt.Sprintf("garden/command/%s", p.PlantID)
-			pub.Publish(topic, 1, false, cmd)
-			log.Printf("[telemetry] published command %q → %s", action, topic)
+			PublishCommand(pub, p.PlantID, action)
 		}
 	}
+}
+
+// PublishCommand sends a pump command to garden/command/{plantID} at QoS 1.
+// Shared by the telemetry handler, the tick-driven safety enforcer, and the
+// startup fail-safe so command formatting lives in one place.
+func PublishCommand(pub Publisher, plantID, action string) {
+	cmd, _ := json.Marshal(domain.Command{PlantID: plantID, Action: action})
+	topic := fmt.Sprintf("garden/command/%s", plantID)
+	pub.Publish(topic, 1, false, cmd)
+	log.Printf("[command] published %q → %s", action, topic)
 }
 
 // HandleSetup tracks MAC addresses of unprovisioned edge nodes.
@@ -145,7 +153,7 @@ func HandleAdmin(
 			return
 		}
 
-		cfg.Plants[p.PlantID] = config.PlantConfig{
+		cfg.SetPlant(p.PlantID, config.PlantConfig{
 			DisplayName:     p.DisplayName,
 			MAC:             p.MAC,
 			MinMoisture:     p.MinMoisture,
@@ -153,7 +161,7 @@ func HandleAdmin(
 			MinTemp:         p.MinTemp,
 			MaxTemp:         p.MaxTemp,
 			CooldownSeconds: p.CooldownSeconds,
-		}
+		})
 		if err := config.Save(cfgPath, cfg); err != nil {
 			log.Printf("[admin] failed to save config: %v", err)
 			return

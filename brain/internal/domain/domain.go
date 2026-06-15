@@ -20,6 +20,10 @@ type PlantConfig struct {
 	MinTemp        float64
 	MaxTemp        float64
 	CooldownPeriod time.Duration
+	// MaxWaterPeriod is the hard cap on how long the pump may run before the
+	// controller forces it off, independent of telemetry. Safety backstop
+	// against a stuck sensor, popped tube, or stalled telemetry.
+	MaxWaterPeriod time.Duration
 }
 
 // Decision is the output of one Controller.Evaluate call.

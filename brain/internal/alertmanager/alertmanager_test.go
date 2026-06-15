@@ -37,9 +37,9 @@ func (r *recorder) lastSubject() string {
 func newTestSetup() (*time.Time, *recorder, *alertmanager.AlertManager) {
 	now := time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC)
 	rec := &recorder{}
-	plants := map[string]config.PlantConfig{
+	plants := &config.Config{Plants: map[string]config.PlantConfig{
 		"p1": {DisplayName: "Plant One", MinMoisture: 20, MaxMoisture: 60},
-	}
+	}}
 	am := alertmanager.New(rec, alertmanager.Config{
 		ReNotifyInterval: 4 * time.Hour,
 		WatchdogTimeout:  20 * time.Minute,
@@ -172,9 +172,9 @@ func newWatchdogSetup(s *state.Store) (*time.Time, *recorder, *alertmanager.Aler
 	seenAt := s.AllLastSeen()["p1"]
 	clk := seenAt
 	rec := &recorder{}
-	plants := map[string]config.PlantConfig{
+	plants := &config.Config{Plants: map[string]config.PlantConfig{
 		"p1": {DisplayName: "Plant One"},
-	}
+	}}
 	am := alertmanager.New(rec, alertmanager.Config{
 		ReNotifyInterval: 4 * time.Hour,
 		WatchdogTimeout:  20 * time.Minute,

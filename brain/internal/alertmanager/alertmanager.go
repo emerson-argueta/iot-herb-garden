@@ -118,7 +118,7 @@ func WithClock(fn func() time.Time) Option {
 type AlertManager struct {
 	notifier notifier.Notifier
 	cfg      Config
-	plants   map[string]config.PlantConfig // read-only; used only for display names
+	plants   *config.Config // source of plant configs; accessed via locked getters
 
 	mu           sync.Mutex
 	records      map[alertKey]alertRecord
@@ -127,9 +127,9 @@ type AlertManager struct {
 	now func() time.Time
 }
 
-// New creates an AlertManager. plants is the plant config map from config.yaml
-// and is used only to resolve display names in email bodies.
-func New(n notifier.Notifier, cfg Config, plants map[string]config.PlantConfig, opts ...Option) *AlertManager {
+// New creates an AlertManager. plants is the loaded config; it is read through
+// locked getters to resolve display names in email bodies.
+func New(n notifier.Notifier, cfg Config, plants *config.Config, opts ...Option) *AlertManager {
 	am := &AlertManager{
 		notifier:     n,
 		cfg:          cfg,
@@ -327,7 +327,7 @@ func (am *AlertManager) formatBody(
 }
 
 func (am *AlertManager) displayName(plantID string) string {
-	if p, ok := am.plants[plantID]; ok && p.DisplayName != "" {
+	if p, ok := am.plants.GetPlant(plantID); ok && p.DisplayName != "" {
 		return p.DisplayName
 	}
 	return plantID
@@ -339,7 +339,7 @@ func (am *AlertManager) wateringDetail(plantID string, d domain.Decision) string
 	if d.AlertMsg != "" {
 		return fmt.Sprintf("Pump activated. Sensor reading: %s", d.AlertMsg)
 	}
-	if p, ok := am.plants[plantID]; ok {
+	if p, ok := am.plants.GetPlant(plantID); ok {
 		return fmt.Sprintf(
 			"Pump activated — moisture below %.0f%% minimum threshold.", p.MinMoisture)
 	}

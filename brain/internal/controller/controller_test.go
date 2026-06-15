@@ -383,3 +383,63 @@ func TestReset_ClearsHysteresisAndCooldown(t *testing.T) {
 		t.Error("WaterOn must fire after Reset clears stale state")
 	}
 }
+
+// ── Safety: max-watering cap (EnforceMaxWatering) ─────────────────────────────
+
+// safetyCfg waters on below 20% with a 60s hard pump-on cap.
+var safetyCfg = domain.PlantConfig{
+	MinMoisture:    20,
+	MaxMoisture:    60,
+	MinTemp:        15,
+	MaxTemp:        30,
+	CooldownPeriod: 20 * time.Minute,
+	MaxWaterPeriod: 60 * time.Second,
+}
+
+func TestEnforceMaxWatering_ForcesOffPastDeadline(t *testing.T) {
+	ctrl, now := newClockCtrl()
+	if d := ctrl.Evaluate(safetyCfg, telemetry(15, 22)); !d.Watering {
+		t.Fatal("precondition: pump should be on after WaterOn")
+	}
+
+	*now = now.Add(61 * time.Second) // past the 60s cap
+	off := ctrl.EnforceMaxWatering(*now)
+
+	if len(off) != 1 || off[0] != "thyme_1" {
+		t.Fatalf("expected [thyme_1] forced off, got %v", off)
+	}
+}
+
+func TestEnforceMaxWatering_NoOpBeforeDeadline(t *testing.T) {
+	ctrl, now := newClockCtrl()
+	ctrl.Evaluate(safetyCfg, telemetry(15, 22))
+
+	*now = now.Add(59 * time.Second) // still within the cap
+	if off := ctrl.EnforceMaxWatering(*now); len(off) != 0 {
+		t.Fatalf("expected no forced-off plants before deadline, got %v", off)
+	}
+}
+
+func TestEnforceMaxWatering_IgnoresIdlePumps(t *testing.T) {
+	ctrl, now := newClockCtrl()
+	ctrl.Evaluate(safetyCfg, telemetry(40, 22)) // in range, pump stays off
+
+	*now = now.Add(10 * time.Minute)
+	if off := ctrl.EnforceMaxWatering(*now); len(off) != 0 {
+		t.Fatalf("idle pump must never be force-stopped, got %v", off)
+	}
+}
+
+func TestEnforceMaxWatering_FiresOncePerRun(t *testing.T) {
+	ctrl, now := newClockCtrl()
+	ctrl.Evaluate(safetyCfg, telemetry(15, 22))
+
+	*now = now.Add(61 * time.Second)
+	if off := ctrl.EnforceMaxWatering(*now); len(off) != 1 {
+		t.Fatalf("first enforce should force off once, got %v", off)
+	}
+	// Deadline is cleared on force-off, so a second sweep is a no-op.
+	if off := ctrl.EnforceMaxWatering(*now); len(off) != 0 {
+		t.Fatalf("second enforce must not re-fire, got %v", off)
+	}
+}

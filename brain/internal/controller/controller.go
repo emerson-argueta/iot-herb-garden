@@ -41,18 +41,20 @@ func WithClock(fn func() time.Time) Option {
 // Controller holds per-plant hysteresis and cooldown state.
 // All exported methods are safe for concurrent use.
 type Controller struct {
-	mu          sync.Mutex
-	watering    map[string]bool      // current pump state per plant
-	cooledUntil map[string]time.Time // cooldown expiry per plant
-	now         func() time.Time
+	mu            sync.Mutex
+	watering      map[string]bool      // current pump state per plant
+	cooledUntil   map[string]time.Time // cooldown expiry per plant
+	waterDeadline map[string]time.Time // hard pump-off deadline per plant
+	now           func() time.Time
 }
 
 // New creates a Controller with real wall time unless overridden by [WithClock].
 func New(opts ...Option) *Controller {
 	c := &Controller{
-		watering:    make(map[string]bool),
-		cooledUntil: make(map[string]time.Time),
-		now:         time.Now,
+		watering:      make(map[string]bool),
+		cooledUntil:   make(map[string]time.Time),
+		waterDeadline: make(map[string]time.Time),
+		now:           time.Now,
 	}
 	for _, opt := range opts {
 		opt(c)
@@ -86,9 +88,11 @@ func (c *Controller) Evaluate(cfg domain.PlantConfig, t domain.Telemetry) domain
 	// --- Moisture / pump state machine ---
 	switch {
 	case !wasWatering && !inCooldown && t.Moisture < cfg.MinMoisture:
-		// Soil is dry and pump is idle: start watering and open the cooldown window.
+		// Soil is dry and pump is idle: start watering, open the cooldown window,
+		// and arm the hard pump-off deadline as a safety backstop.
 		c.watering[id] = true
 		c.cooledUntil[id] = now.Add(cfg.CooldownPeriod)
+		c.waterDeadline[id] = now.Add(cfg.MaxWaterPeriod)
 		d.Watering = true
 		d.WateringChanged = true
 		d.InCooldown = true // cooldown begins this tick
@@ -96,6 +100,7 @@ func (c *Controller) Evaluate(cfg domain.PlantConfig, t domain.Telemetry) domain
 	case wasWatering && !inCooldown && t.Moisture > cfg.MaxMoisture:
 		// Cooldown has elapsed and soil is saturated: stop watering.
 		c.watering[id] = false
+		delete(c.waterDeadline, id)
 		d.Watering = false
 		d.WateringChanged = true
 	}
@@ -129,6 +134,30 @@ func (c *Controller) Evaluate(cfg domain.PlantConfig, t domain.Telemetry) domain
 	return d
 }
 
+// EnforceMaxWatering forces off any plant whose pump has run past its hard
+// deadline and returns their IDs. It is driven by the tick goroutine (wall
+// clock), independent of telemetry, so a stuck sensor or stalled edge node
+// cannot leave the pump on indefinitely. The caller publishes water_off for
+// each returned ID.
+func (c *Controller) EnforceMaxWatering(now time.Time) []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	var off []string
+	for id, on := range c.watering {
+		if !on {
+			continue
+		}
+		deadline, ok := c.waterDeadline[id]
+		if ok && now.After(deadline) {
+			c.watering[id] = false
+			delete(c.waterDeadline, id)
+			off = append(off, id)
+		}
+	}
+	return off
+}
+
 // Reset clears all stored state for a plant. Call this when a device is
 // reprovisioned so stale hysteresis state does not carry over.
 func (c *Controller) Reset(plantID string) {
@@ -136,4 +165,5 @@ func (c *Controller) Reset(plantID string) {
 	defer c.mu.Unlock()
 	delete(c.watering, plantID)
 	delete(c.cooledUntil, plantID)
+	delete(c.waterDeadline, plantID)
 }

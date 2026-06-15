@@ -90,12 +90,23 @@ func main() {
 		}
 	}
 
+	// Fail-safe to off: the brain's in-memory pump state does not survive a
+	// restart, so on boot we cannot know which pumps an edge node left running.
+	// Command every known plant off and let telemetry re-establish real state.
+	failSafeOff(client, cfg)
+
 	ticker := time.NewTicker(tickInterval)
 	defer ticker.Stop()
 
 	go func() {
 		for range ticker.C {
 			publishState(client, store)
+			// Safety backstop: force off any pump that has run past its hard
+			// deadline. Tick-driven so a stalled edge node cannot keep it on.
+			for _, id := range ctrl.EnforceMaxWatering(time.Now()) {
+				log.Printf("[safety] max watering time exceeded for %s — forcing off", id)
+				mqttclient.PublishCommand(client, id, "water_off")
+			}
 			// AlertManager runs in the same tick goroutine after state is
 			// published. It never blocks the MQTT message handler goroutines.
 			alerts.Check(store)
@@ -135,7 +146,21 @@ func buildAlertManager(cfg *config.Config) *alertmanager.AlertManager {
 	return alertmanager.New(notif, alertmanager.Config{
 		ReNotifyInterval: n.ReNotifyInterval(),
 		WatchdogTimeout:  n.WatchdogTimeout(),
-	}, cfg.Plants)
+	}, cfg)
+}
+
+// failSafeOff commands every configured plant's pump off at startup. The
+// brain's pump state is in-memory only, so after a restart it has no record of
+// what an edge node left running; defaulting everything to off prevents a pump
+// from being stuck on across a brain crash until telemetry resumes.
+func failSafeOff(client pahomqtt.Client, cfg *config.Config) {
+	ids := cfg.PlantIDs()
+	for _, id := range ids {
+		mqttclient.PublishCommand(client, id, "water_off")
+	}
+	if len(ids) > 0 {
+		log.Printf("[startup] fail-safe: sent water_off to %d plant(s)", len(ids))
+	}
 }
 
 // publishState assembles the master snapshot from the store and publishes it.

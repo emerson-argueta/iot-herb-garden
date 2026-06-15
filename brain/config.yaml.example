@@ -22,3 +22,4 @@ plants:
         min_temp: 15
         max_temp: 30
         cooldown_seconds: 1200
+        max_water_seconds: 60   # hard pump-on cap; brain forces off after this. Keep below the edge node's own hardware timer.
